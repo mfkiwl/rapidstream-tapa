@@ -14,8 +14,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -27,7 +29,7 @@ namespace internal {
 
 template <typename Param, typename Arg>
 struct accessor {
-  static Param access(Arg&& arg) { return arg; }
+  static Param access(Arg&& arg, bool) { return arg; }
   static void access(fpga::Instance& instance, int& idx, Arg&& arg) {
     instance.SetArg(idx++, static_cast<Param>(arg));
   }
@@ -35,7 +37,7 @@ struct accessor {
 
 template <typename T>
 struct accessor<T, seq> {
-  static T access(seq&& arg) { return arg.pos++; }
+  static T access(seq&& arg, bool) { return arg.pos++; }
   static void access(fpga::Instance& instance, int& idx, seq&& arg) {
     instance.SetArg(idx++, static_cast<T>(arg.pos++));
   }
@@ -43,6 +45,14 @@ struct accessor<T, seq> {
 
 void* allocate(size_t length);
 void deallocate(void* addr, size_t length);
+
+// std::bind wrapper with arguments evaluated from left to right.
+struct binder {
+  template <typename F, typename... Args>
+  binder(F&& f, Args&&... args)
+      : result(std::bind(std::forward<F>(f), std::forward<Args>(args)...)) {}
+  std::function<void()> result;
+};
 
 template <typename F>
 struct invoker {
@@ -57,9 +67,8 @@ struct invoker {
   static void invoke(int mode, F&& f, Args&&... args) {
     // Create a functor that captures args by value
     auto functor = invoker::functor_with_accessors(
-        std::forward<F>(f), std::index_sequence_for<Args...>{},
+        mode > 0, std::forward<F>(f), std::index_sequence_for<Args...>{},
         std::forward<Args>(args)...);
-
     if (mode > 0) {  // Sequential scheduling.
       std::move(functor)();
     } else {
@@ -128,12 +137,15 @@ struct invoker {
   }
 
   template <typename Func, size_t... Is, typename... CapturedArgs>
-  static auto functor_with_accessors(Func&& func, std::index_sequence<Is...>,
+  static auto functor_with_accessors(bool is_sequential, Func&& func,
+                                     std::index_sequence<Is...>,
                                      CapturedArgs&&... args) {
     // std::bind creates a copy of args
-    return std::bind(
+    // Aggregate initialization evaluates args from left to right.
+    return binder{
         func, accessor<std::tuple_element_t<Is, Params>, CapturedArgs>::access(
-                  std::forward<CapturedArgs>(args))...);
+                  std::forward<CapturedArgs>(args), is_sequential)...}
+        .result;
   }
 };
 

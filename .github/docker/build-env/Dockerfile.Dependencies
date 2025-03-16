@@ -45,6 +45,8 @@ RUN ln -fs /usr/share/zoneinfo/UTC /etc/localtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
+      # Update the following line to the latest date for retriggering the docker build
+      echo "Installing system dependencies as of 20250306" && \
       apt-get upgrade -y && \
       apt-get install --no-install-recommends -y \
         apt-transport-https \
@@ -76,7 +78,6 @@ RUN apt-get update && \
       rm -f /tmp/xrt.deb && \
       apt-get update && \
       apt-get upgrade -y && \
-      echo Update Bazel to 8.0.0 && \
       apt-get install --no-install-recommends -y bazel && \
       apt-get purge --auto-remove -y \
         gnupg \
@@ -94,16 +95,11 @@ RUN curl -sSL \
 
 # Install Pre-Commit
 RUN curl -sSL \
-        https://github.com/niess/python-appimage/releases/download/python3.12/python3.12.8-cp312-cp312-manylinux2014_x86_64.AppImage \
-        -o /opt/python3.12 && \
-    chmod +x /opt/python3.12 && \
-    cd /opt && \
-    /opt/python3.12 --appimage-extract && \
-    rm -f /opt/python3.12 && \
-    mv /opt/squashfs-root /opt/python3.12 && \
-    /opt/python3.12/usr/bin/python3.12 -m pip install pre-commit && \
-    ln -s /opt/python3.12/usr/bin/pre-commit /usr/local/bin/pre-commit && \
-    chmod -R go=u /opt/python3.12
+        https://github.com/astral-sh/python-build-standalone/releases/download/20250212/cpython-3.13.2+20250212-x86_64-unknown-linux-gnu-install_only.tar.gz \
+        | tar -xz -C /opt && \
+    /opt/python/bin/python3 -m pip install pre-commit && \
+    ln -s /opt/python/bin/pre-commit /usr/local/bin/pre-commit && \
+    chmod -R go=u /opt/python
 
 # Rebuild locale so that Vivado can run in the Docker
 RUN echo "en_US.UTF-8 UTF-8" > /etc/locale.gen && locale-gen

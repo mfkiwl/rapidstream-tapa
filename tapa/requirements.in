@@ -1,8 +1,13 @@
 click
 coloredlogs
+intervaltree
 jinja2
-nuitka
+networkx
+nuitka==2.6.6
 psutil
+pydantic
+pyslang
+pytest
 pyverilog
 pyyaml
 toposort

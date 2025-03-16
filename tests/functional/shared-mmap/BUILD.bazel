@@ -4,6 +4,7 @@
 # All rights reserved. The contributor(s) of this file has/have agreed to the
 # RapidStream Contributor License Agreement.
 
+load("@rules_cc//cc:defs.bzl", "cc_binary")
 load("//bazel:tapa_rules.bzl", "tapa_xo")
 
 sh_test(
@@ -53,4 +54,15 @@ tapa_xo(
     src = "vadd.cpp",
     platform_name = "xilinx_u250_gen3x16_xdma_4_1_202210_1",
     top_name = "VecAddShared",
+)
+
+sh_test(
+    name = "shared-mmap-pragma-test",
+    srcs = ["shared-mmap-pragma-test.sh"],
+    args = [
+        "$(location :shared-mmap-xo)",
+    ],
+    data = [
+        ":shared-mmap-xo",
+    ],
 )

@@ -5,6 +5,7 @@
 # RapidStream Contributor License Agreement.
 
 load("@rules_pkg//pkg:mappings.bzl", "pkg_attributes", "pkg_filegroup", "pkg_files", "pkg_mklink", "strip_prefix")
+load("@rules_python//python:defs.bzl", "py_library")
 load("@rules_python//python:py_binary.bzl", "py_binary")
 load("//bazel:nuitka_rules.bzl", "nuitka_binary")
 
@@ -14,7 +15,7 @@ nuitka_binary(
     flags = [
         "--deployment",
         "--include-package-data=tapa:VERSION",
-        "--python-flag=isolated,no_docstrings,no_site,no_warnings",
+        "--python-flag=isolated,no_docstrings,no_site",
     ],
     output_name = "tapa-fast-cosim",
 )
@@ -23,7 +24,8 @@ py_binary(
     name = "tapa-fast-cosim",
     srcs = ["__main__.py"],
     data = [
-        "//fpga-runtime:tapa_fast_cosim_dpi",
+        "//fpga-runtime:tapa_fast_cosim_dpi_legacy_rdi",
+        "//fpga-runtime:tapa_fast_cosim_dpi_xv",
     ],
     main = "__main__.py",
     visibility = ["//visibility:public"],
