@@ -3,6 +3,8 @@ coloredlogs
 jinja2
 nuitka
 psutil
+pyslang
+pytest
 pyverilog
 pyyaml
 toposort

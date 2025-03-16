@@ -11,17 +11,19 @@ def _tapa_xo_impl(ctx):
     src = ctx.file.src
     top_name = ctx.attr.top_name
     platform_name = ctx.attr.platform_name
-    output_file = ctx.actions.declare_file(
-        ctx.attr.output_file or "{}.{}.hw.xo".format(top_name, platform_name),
-    )
+    work_dir = ctx.actions.declare_directory(ctx.attr.name + ".tapa")
 
-    # Start building the command to run tapa-cli analyze.
-    tapa_cmd = [tapa_cli.path, "analyze", "-f", src.path, "--top", top_name]
+    output_file = ctx.outputs.output_file
+    if output_file == None and ctx.attr.vitis_mode:
+        output_file = ctx.actions.declare_file(ctx.attr.name + ".xo")
 
-    # Add custom rtl
-    if ctx.attr.custom_rtl_files:
-        for rtl_file in ctx.files.custom_rtl_files:
-            tapa_cmd.extend(["--add-rtl", rtl_file.path])
+    outputs = [work_dir]
+
+    # Start building the command to run tapa-cli.
+    tapa_cmd = [tapa_cli.path, "--work-dir", work_dir.path]
+
+    # Build the command for tapa-cli analyze.
+    tapa_cmd.extend(["analyze", "--input", src.path, "--top", top_name])
 
     # Add tapacc and tapa-clang executables.
     if ctx.file.tapacc:
@@ -34,9 +36,14 @@ def _tapa_xo_impl(ctx):
         tapa_cmd.extend(["--cflags", ctx.attr.cflags])
 
     # Add include directory, if specified.
-    if ctx.attr.include:
+    if ctx.files.include:
         for include in ctx.files.include:
             tapa_cmd.extend(["--cflags", "-I" + include.path])
+
+    if ctx.attr.vitis_mode:
+        tapa_cmd.extend(["--vitis-mode"])
+    else:
+        tapa_cmd.extend(["--no-vitis-mode"])
 
     # Build the command for tapa-cli synth.
     tapa_cmd.extend(["synth", "--platform", platform_name])
@@ -50,14 +57,24 @@ def _tapa_xo_impl(ctx):
         tapa_cmd.extend(["--clock-period", ctx.attr.clock_period])
     if ctx.attr.part_num:
         tapa_cmd.extend(["--part-num", ctx.attr.part_num])
+    if ctx.attr.enable_synth_util:
+        tapa_cmd.extend(["--enable-synth-util"])
 
-    # Complete the command sequence with link and pack commands.
+    # Build the command for tapa-cli link.
     tapa_cmd.extend(["link"])
-    tapa_cmd.extend(["pack", "--output", output_file.path])
+
+    # Complete the command sequence with the pack command.
+    if output_file != None:
+        tapa_cmd.extend(["pack", "--output", output_file.path])
+        outputs = [output_file] + outputs
+
+    # Add custom rtl
+    for rtl_file in ctx.files.custom_rtl_files:
+        tapa_cmd.extend(["--custom-rtl", rtl_file.path])
 
     # Define a custom action to run the synthesized command.
     ctx.actions.run(
-        outputs = [output_file],
+        outputs = outputs,
         inputs = [src] + ctx.files.hdrs + ctx.files.custom_rtl_files,
         tools = [tapa_cli, ctx.executable.vitis_hls_env],
         executable = ctx.executable.vitis_hls_env,
@@ -65,7 +82,7 @@ def _tapa_xo_impl(ctx):
     )
 
     # Return default information, including the output file.
-    return [DefaultInfo(files = depset([output_file]))]
+    return [DefaultInfo(files = depset([output_file or work_dir]))]
 
 # Define the custom Bazel rule.
 tapa_xo = rule(
@@ -78,7 +95,7 @@ tapa_xo = rule(
         "top_name": attr.string(mandatory = True),
         "custom_rtl_files": attr.label_list(allow_files = True),
         "platform_name": attr.string(mandatory = True),
-        "output_file": attr.string(),
+        "output_file": attr.output(),
         "tapa_cli": attr.label(
             cfg = "exec",
             default = Label("//tapa"),
@@ -87,8 +104,13 @@ tapa_xo = rule(
         "tapacc": attr.label(allow_single_file = True),
         "tapa_clang": attr.label(allow_single_file = True),
         "cflags": attr.string(),
+        "vitis_mode": attr.bool(
+            default = True,
+            doc = "If true, generate XO as `output_file`. Otherwise, generate RTL in the work dir as `output_file`.",
+        ),
         "clock_period": attr.string(),
         "part_num": attr.string(),
+        "enable_synth_util": attr.bool(),
         "vitis_hls_env": attr.label(
             cfg = "exec",
             default = Label("//bazel:vitis_hls_env"),

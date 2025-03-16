@@ -5,6 +5,7 @@
 # RapidStream Contributor License Agreement.
 
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_filegroup", "pkg_files", "strip_prefix")
 load("//bazel:header_extractor.bzl", "header_extractor")
 
@@ -72,6 +73,7 @@ pkg_files(
     srcs = [":tapa"],
     prefix = "usr/lib",
     strip_prefix = strip_prefix.files_only(),
+    visibility = ["//visibility:public"],
 )
 
 pkg_files(
@@ -79,6 +81,7 @@ pkg_files(
     srcs = [":include"],
     prefix = "usr/include",
     strip_prefix = strip_prefix.from_pkg(),
+    visibility = ["//visibility:public"],
 )
 
 pkg_files(

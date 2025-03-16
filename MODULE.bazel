@@ -3,7 +3,7 @@ TAPA is a dataflow HLS framework that features fast compilation, expressive
 programming model and generates high-frequency FPGA accelerators.
 """
 
-# Copyright (c) 2024 RapidStream Design Automation, Inc. and contributors.
+# Copyright (c) 2025 RapidStream Design Automation, Inc. and contributors.
 # All rights reserved. The contributor(s) of this file has/have agreed to the
 # RapidStream Contributor License Agreement.
 
@@ -11,12 +11,12 @@ module(name = "rapidstream-tapa")
 
 # Bazel dependencies
 bazel_dep(name = "bazel_skylib", version = "1.7.1")
-bazel_dep(name = "platforms", version = "0.0.10")
-bazel_dep(name = "rules_cc", version = "0.1.0")
+bazel_dep(name = "platforms", version = "0.0.11")
+bazel_dep(name = "rules_cc", version = "0.1.1")
 bazel_dep(name = "rules_pkg", version = "1.0.1")
-bazel_dep(name = "rules_python", version = "1.0.0")
+bazel_dep(name = "rules_python", version = "1.2.0")
 
-bazel_dep(name = "toolchains_llvm", version = "1.2.0", dev_dependency = True)
+bazel_dep(name = "toolchains_llvm", version = "1.3.0", dev_dependency = True)
 
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
@@ -47,26 +47,26 @@ register_toolchains(
 python.toolchain(
     configure_coverage_tool = True,
     is_default = True,
-    python_version = "3.10.12",
+    python_version = "3.13.1",
 )
-use_repo(python, python_3_10 = "python_3_10_12")
+use_repo(python, python_3_13 = "python_3_13_1")
 
 # Required by tapa Python libraries
 pip.parse(
     hub_name = "tapa_deps",
-    python_version = "3.10.12",
+    python_version = "3.13.1",
     requirements_lock = "//tapa:requirements_lock.txt",
 )
 use_repo(pip, "tapa_deps")
 
 # Required by tapacc
-bazel_dep(name = "nlohmann_json", version = "3.11.3")
+bazel_dep(name = "nlohmann_json", version = "3.11.3.bcr.1")
 
 # Required by tapa-lib
 bazel_dep(name = "rules_boost", repo_name = "com_github_nelhage_rules_boost")
 git_override(
     module_name = "rules_boost",
-    commit = "40ce3bdc3d2f947aa3421b38ae4d3e8bd3ace7fc",
+    commit = "c3edeeb93c47ee87d01fc96aec8e48ca9449d10c",
     patch_cmds = [
         # Enable BOOST_USE_ASAN, which requires BOOST_USE_UCONTEXT.
         """sed '/name = "context",/a defines=["BOOST_USE_ASAN","BOOST_USE_UCONTEXT"],' -i boost.BUILD""",
@@ -84,7 +84,7 @@ bazel_dep(name = "gflags", version = "2.2.2")
 # glog must be 0.5.0 as in later versions, bazel is strictly required for
 # including glog headers for the host code
 bazel_dep(name = "glog", version = "0.5.0")
-bazel_dep(name = "googletest", version = "1.15.2")
+bazel_dep(name = "googletest", version = "1.16.0")
 
 single_version_override(
     module_name = "glog",
@@ -101,11 +101,25 @@ cc_library(
     visibility = ["//visibility:public"],
 )
     """,
-    path = "/opt/tools/xilinx/Vitis_HLS/2024.1",
+    path = "/opt/tools/xilinx/Vitis/2024.2",
 )
 
 new_local_repository(
-    name = "xsim",
+    name = "xsim_xv",
+    build_file_content = """
+cc_library(
+    name = "svdpi",
+    hdrs = glob(["include/svdpi.h"]),
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+    """,
+    # Starting from 2024.2, Vivado has renamed rdi to xv
+    path = "/opt/tools/xilinx/Vivado/2024.2/data/xsim",
+)
+
+new_local_repository(
+    name = "xsim_legacy_rdi",
     build_file_content = """
 cc_library(
     name = "svdpi",
@@ -144,7 +158,7 @@ bazel_dep(name = "patchelf", version = "0.18.0")
 # Based on patches from https://github.com/bazelbuild/bazel-central-registry/tree/4f4bad8f463685498cf9e0a4ba45ffe9e290a853/modules/patchelf/0.18.0/patches
 git_override(
     module_name = "patchelf",
-    commit = "a0f54334df36770b335c051e540ba40afcbf8378",
+    commit = "769337c227799aa60911562b6940530f4a86eb3c",
     patch_cmds = [
         # 0001-Add-MODULE.bazel.patch
         """
@@ -180,13 +194,15 @@ EOF
 )
 
 # Build LLVM from source
-LLVM_VERSION_MAJOR = 19
+LLVM_VERSION_MAJOR = 20
 
 LLVM_VERSION_MINOR = 1
 
-LLVM_VERSION_PATCH = 5
+LLVM_VERSION_PATCH = 0
 
 LLVM_VERSION = "{}.{}.{}".format(LLVM_VERSION_MAJOR, LLVM_VERSION_MINOR, LLVM_VERSION_PATCH)
+
+LLVM_SHA256 = "4579051e3c255fb4bb795d54324f5a7f3ef79bd9181e44293d7ee9a7f62aad9a"
 
 # Based on patches from https://github.com/bazelbuild/bazel-central-registry/tree/707c0f939d1a801370aeb3a795e1a253a880f4f7/modules/llvm-project/17.0.3/patches
 http_archive(
@@ -206,12 +222,13 @@ module(
     version = "{}",
 )
 
-# Skylark depedndencies
+# Skylark dependencies
 bazel_dep(name = "bazel_skylib", version = "1.7.1")
 
 # Library dependencies
-bazel_dep(name = "platforms", version = "0.0.10")
-bazel_dep(name = "rules_cc", version = "0.1.0")
+bazel_dep(name = "platforms", version = "0.0.11")
+bazel_dep(name = "rules_cc", version = "0.1.1")
+bazel_dep(name = "protobuf", version = "30.0")
 EOF
         """.format(LLVM_VERSION),
         # 0004-Add-BUILD.bazel.patch
@@ -226,15 +243,17 @@ LLVM_VERSION_MAJOR = {0}
 LLVM_VERSION_MINOR = {1}
 LLVM_VERSION_PATCH = {2}
 PACKAGE_VERSION = "{0}.{1}.{2}"
+MAX_CLANG_ABI_COMPAT_VERSION = "{0}"
 EOF
         """.format(LLVM_VERSION_MAJOR, LLVM_VERSION_MINOR, LLVM_VERSION_PATCH),
     ],
     patches = [
-        "//bazel:patches/tapa-llvm-project/0001-Disable-zlib-zstd-mpfr-and-pfm.patch",
+        "//bazel:patches/tapa-llvm-project/0001-Disable-zlib-zstd-mpfr-pfm-and-proto.patch",
         "//bazel:patches/tapa-llvm-project/0002-Add-TAPA-pragmas-to-Clang.patch",
-        "//bazel:patches/tapa-llvm-project/0003-Wno-error-deprecated-declarations.patch",
+        "//bazel:patches/tapa-llvm-project/0003-Wno-error.patch",
+        "//bazel:patches/tapa-llvm-project/0004-Patch-missing-macro.patch",
     ],
-    sha256 = "bd8445f554aae33d50d3212a15e993a667c0ad1b694ac1977f3463db3338e542",
+    sha256 = LLVM_SHA256,
     strip_prefix = "llvm-project-{}.src".format(LLVM_VERSION),
     urls = ["https://github.com/llvm/llvm-project/releases/download/llvmorg-{0}/llvm-project-{0}.src.tar.xz".format(LLVM_VERSION)],
 )

@@ -4,6 +4,8 @@
 # All rights reserved. The contributor(s) of this file has/have agreed to the
 # RapidStream Contributor License Agreement.
 
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
 def _dpi_library_impl(ctx):
     compile_options = [
         "-Wall",
@@ -88,7 +90,22 @@ _dpi_library = rule(
         "deps": attr.label_list(providers = [CcInfo]),
         "_xsc": attr.label(
             cfg = "exec",
-            default = Label("//bazel:xsc"),
+            default = Label("//bazel:xsc_xv"),
+            executable = True,
+        ),
+    },
+)
+
+_dpi_legacy_rdi_library = rule(
+    implementation = _dpi_library_impl,
+    attrs = {
+        "srcs": attr.label_list(allow_files = True),
+        "hdrs": attr.label_list(allow_files = True),
+        "includes": attr.label_list(allow_files = True),
+        "deps": attr.label_list(providers = [CcInfo]),
+        "_xsc": attr.label(
+            cfg = "exec",
+            default = Label("//bazel:xsc_legacy_rdi"),
             executable = True,
         ),
     },
@@ -96,4 +113,8 @@ _dpi_library = rule(
 
 def dpi_library(name, **kwargs):
     _dpi_library(name = name, **kwargs)
-    native.cc_library(name = name + "_cc", **kwargs)
+    cc_library(name = name + "_cc", **kwargs)
+
+def dpi_legacy_rdi_library(name, **kwargs):
+    _dpi_legacy_rdi_library(name = name, **kwargs)
+    cc_library(name = name + "_cc", **kwargs)

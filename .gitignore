@@ -1,9 +1,11 @@
 *.jou
 *.log
+*.out
 *.pyc
 .venv*
 /.cache/
 /.cmake-format
+/.coverage
 /.vscode
 /bazel-*
 /build/
@@ -11,7 +13,9 @@
 __pycache__
 a.out
 artifacts.out/
+device_config.json
+floorplan_config.json
+impl_config.json
 node_modules
 run/
-work.out
 work.xo

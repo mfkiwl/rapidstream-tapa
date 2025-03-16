@@ -23,18 +23,21 @@ from tapa.steps.common import (
 @click.option(
     "--part-num",
     type=str,
-    help="Target FPGA part number.  Must be specified if "
-    "`--platform` is not provided.",
+    help="Target FPGA part number.  Must be specified if `--platform` is not provided.",
 )
 @click.option(
     "--platform",
     "-p",
     type=str,
-    help="Target Vitis platform.  Must be specified if "
-    "`--part-num` is not provided.",
+    help="Target Vitis platform.  Must be specified if `--part-num` is not provided.",
 )
 @click.option("--clock-period", type=float, help="Target clock period in nanoseconds.")
-@click.option("--jobs", "-j", type=int, help="Number of parallel jobs for HLS.")
+@click.option(
+    "--jobs",
+    "-j",
+    type=int,
+    help="Number of parallel jobs for HLS (or RTL synthesis).",
+)
 @click.option(
     "--keep-hls-work-dir / --remove-hls-work-dir",
     type=bool,
@@ -59,6 +62,12 @@ from tapa.steps.common import (
     'e.g., --other-hls-configs "config_compile -unsafe_math_optimizations"',
 )
 @click.option(
+    "--enable-synth-util / --disable-synth-util",
+    type=bool,
+    default=False,
+    help="Enable post-synthesis resource utilization report.",
+)
+@click.option(
     "--print-fifo-ops / --no-print-fifo-ops",
     type=bool,
     default=False,
@@ -78,6 +87,7 @@ def synth(  # noqa: PLR0913,PLR0917
     keep_hls_work_dir: bool,
     skip_hls_based_on_mtime: bool,
     other_hls_configs: str,
+    enable_synth_util: bool,
     print_fifo_ops: bool,
     flow_type: str,
 ) -> None:
@@ -106,12 +116,17 @@ def synth(  # noqa: PLR0913,PLR0917
         flow_type=flow_type,
         platform=platform,
     )
-    program.generate_task_rtl(print_fifo_ops)
+    if flow_type != "aie":
+        program.generate_task_rtl(print_fifo_ops)
+        if enable_synth_util:
+            program.generate_post_synth_util(part_num, jobs)
+        program.generate_top_rtl(print_fifo_ops)
 
-    settings["synthed"] = True
-    store_persistent_context("settings")
+        settings["synthed"] = True
+        store_persistent_context("settings")
+        store_persistent_context("templates_info", program.get_rtl_templates_info())
 
-    is_pipelined("synth", True)
+        is_pipelined("synth", True)
 
 
 def get_device_info(

@@ -14,7 +14,7 @@ import shutil
 import sys
 import zipfile
 from pathlib import Path
-from xml.etree import ElementTree
+from xml.etree import ElementTree as ET
 
 from tapa.cosim.common import Arg, Port
 
@@ -42,8 +42,8 @@ def extract_part_from_xml_file(file_path: str) -> str:
         file_path (str): The path to the XML file.
     """
     try:
-        tree = ElementTree.parse(file_path)
-    except (ElementTree.ParseError, FileNotFoundError) as e:
+        tree = ET.parse(file_path)
+    except (ET.ParseError, FileNotFoundError) as e:
         return f"Error reading or parsing the XML file: {e}"
 
     root = tree.getroot()
@@ -99,7 +99,7 @@ def _parse_xo_update_config(config: dict, tb_output_dir: str) -> None:
 
     # extract other kernel information
     kernel_file_path = glob.glob(f"{tmp_path}/*/kernel.xml")[0]
-    kernel_xml = ElementTree.parse(kernel_file_path).getroot().find("./kernel")
+    kernel_xml = ET.parse(kernel_file_path).getroot().find("./kernel")
     if kernel_xml is None:
         _logger.error("Fail to extract kernel name")
         sys.exit(1)
@@ -155,9 +155,9 @@ def _check_scalar_val_format(config: dict) -> None:
             "with the suffix 'h according to Verilog syntax. "
             f"Violation: {scalar}: {val}"
         )
-        assert (
-            len(val) <= 2 + 16
-        ), f"scalar value should be at most 64 bit. Violation: {scalar}: {val}"
+        assert len(val) <= 2 + 16, (
+            f"scalar value should be at most 64 bit. Violation: {scalar}: {val}"
+        )
 
 
 def preprocess_config(

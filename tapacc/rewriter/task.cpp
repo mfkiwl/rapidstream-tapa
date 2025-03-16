@@ -67,12 +67,18 @@ static std::map<TapaTargetAttr::TargetType,
              {TapaTargetAttr::VendorType::Xilinx,
               XilinxAIETarget::GetInstance()},
          }},
+        {TapaTargetAttr::TargetType::NON_SYNTHESIZABLE,
+         {
+             {TapaTargetAttr::VendorType::Xilinx,
+              XilinxNonSynthesizableTarget::GetInstance()},
+         }},
     };
 
 extern const string* top_name;
 
 // Given a Stmt, find the first tapa::task in its children.
 const ExprWithCleanups* GetTapaTask(const Stmt* stmt) {
+  if (!stmt) return nullptr;
   for (auto child : stmt->children()) {
     if (auto expr = dyn_cast<ExprWithCleanups>(child)) {
       if (expr->getType().getCanonicalType().getAsString() ==
@@ -126,22 +132,25 @@ void Visitor::VisitTask(const clang::FunctionDecl* func) {
     vendor = TapaTargetAttr::VendorType::Xilinx;
   }
 
-  auto& metadata = GetMetadata();
-  metadata["target"] = TapaTargetAttr::ConvertTargetTypeToStr(target);
-  metadata["vendor"] = TapaTargetAttr::ConvertVendorTypeToStr(vendor);
+  // The task metadata should only be obtained from the function definition
+  if (func->isThisDeclarationADefinition()) {
+    auto& metadata = GetMetadata();
+    metadata["target"] = TapaTargetAttr::ConvertTargetTypeToStr(target);
+    metadata["vendor"] = TapaTargetAttr::ConvertVendorTypeToStr(vendor);
 
-  if (target_map.find(target) == target_map.end() ||
-      target_map[target].find(vendor) == target_map[target].end()) {
-    static const auto diagnostic_id =
-        this->context_.getDiagnostics().getCustomDiagID(
-            clang::DiagnosticsEngine::Error, "unsupported target: %0");
-    this->context_.getDiagnostics()
-        .Report(func->getLocation(), diagnostic_id)
-        .AddString(std::string(metadata["target"]) + " by " +
-                   std::string(metadata["vendor"]));
-    current_target = XilinxHLSTarget::GetInstance();
-  } else {
-    current_target = target_map[target][vendor];
+    if (target_map.find(target) == target_map.end() ||
+        target_map[target].find(vendor) == target_map[target].end()) {
+      static const auto diagnostic_id =
+          this->context_.getDiagnostics().getCustomDiagID(
+              clang::DiagnosticsEngine::Error, "unsupported target: %0");
+      this->context_.getDiagnostics()
+          .Report(func->getLocation(), diagnostic_id)
+          .AddString(std::string(metadata["target"]) + " by " +
+                     std::string(metadata["vendor"]));
+      current_target = XilinxHLSTarget::GetInstance();
+    } else {
+      current_target = target_map[target][vendor];
+    }
   }
 
   TraverseDecl(func->getASTContext().getTranslationUnitDecl());
@@ -151,31 +160,49 @@ void Visitor::VisitTask(const clang::FunctionDecl* func) {
 bool Visitor::VisitFunctionDecl(FunctionDecl* func) {
   rewriting_func = nullptr;
 
-  // If the visited function is a global function with a body, and it is in the
+  // If the visited function is a global function, and it is in the
   // main file, then it is a candidate for transformation.
-  if (func->hasBody() && func->isGlobal() &&
-      context_.getSourceManager().isWrittenInMainFile(func->getBeginLoc())) {
+  if (func->isGlobal() &&
+      context_.getSourceManager().isWrittenInMainFile(func->getLocation())) {
     if (is_first_traversal) {
-      // For the first traversal, collect all functions.
-      funcs_.push_back(func);
+      // For the first traversal, collect all functions with body.
+      if (func->hasBody()) funcs_.push_back(func);
     } else {
       // For the second traversal, process tapa task functions.
       assert(rewriters_.count(func) > 0);
       rewriting_func = func;
 
       // Run this before the function body is purged
-      if (func->hasAttrs()) {
+      if (func->hasAttrs() && func->hasBody()) {
         HandleAttrOnNodeWithBody(func, func->getBody(), func->getAttrs());
       }
 
       bool is_top_level_task = IsTapaTopLevel(func);
       // If the first tapa::task is obtained in the function body, this is a
       // upper-level tapa task.
-      bool is_upper_level_task = GetTapaTask(func->getBody()) != nullptr;
+      // FIXME: This is not a perfect way to determine the level of the task,
+      // especially when visiting the function signature.
+      bool is_upper_level_task =
+          is_top_level_task || GetTapaTask(func->getBody()) != nullptr;
+      // if the task is non-synthesizable, it is a lower-level tapa task.
+      if (IsTaskNonSynthesizable(func)) {
+        is_upper_level_task = false;
+        if (is_top_level_task) {
+          static const auto diagnostic_id =
+              this->context_.getDiagnostics().getCustomDiagID(
+                  clang::DiagnosticsEngine::Error,
+                  "tapa top-level task cannot be non-synthesizable");
+          this->context_.getDiagnostics().Report(func->getLocation(),
+                                                 diagnostic_id);
+        }
+      }
       // If the task is in the task invocation graph from the top-level task,
       // it is a lower-level tapa task.
       bool is_lower_level_task =
           !is_upper_level_task && tapa_tasks_.count(func) > 0;
+      // If the decl is the one being visited or its signature.
+      bool is_current_task =
+          func->getNameAsString() == current_task->getNameAsString();
 
       // Rewrite the function arguments.
       if (is_top_level_task) {
@@ -188,13 +215,13 @@ bool Visitor::VisitFunctionDecl(FunctionDecl* func) {
         current_target->RewriteOtherFuncArguments(func, GetRewriter());
       }
 
-      if ((is_upper_level_task || is_lower_level_task) &&
-          func != current_task) {
+      if ((is_upper_level_task || is_lower_level_task) && !is_current_task) {
         // If the function is a tapa task but not the current task,
         // We deal with AIE and HLS differently.
         // For HLS, we reserve the function signature and remove the body.
         // For AIE, we remove the function signature and body.
-        current_target->ProcessNonCurrentTask(func, GetRewriter());
+        current_target->ProcessNonCurrentTask(func, GetRewriter(),
+                                              IsTapaTopLevel(current_task));
 
       } else if (is_upper_level_task) {
         auto task = GetTapaTask(func->getBody());
@@ -225,28 +252,24 @@ bool Visitor::VisitAttributedStmt(clang::AttributedStmt* stmt) {
   return clang::RecursiveASTVisitor<Visitor>::VisitAttributedStmt(stmt);
 }
 
-// Apply tapa s2s transformations on a upper-level task.
-void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
-                                    const FunctionDecl* func) {
-  if (IsTapaTopLevel(func)) {
-    current_target->RewriteTopLevelFunc(func, GetRewriter());
-  } else {
-    current_target->RewriteMiddleLevelFunc(func, GetRewriter());
-  }
-
-  // Obtain the connection schema from the task.
-  // metadata: {tasks, fifos}
-  // tasks: {task_name: [{step, {args: port_name: {var_type, var_name}}}]}
-  // fifos: {fifo_name: {depth, produced_by, consumed_by}}
-  auto& metadata = GetMetadata();
-  metadata["fifos"] = json::object();
-
+void Visitor::ProcessTaskPorts(const FunctionDecl* func,
+                               nlohmann::json& metadata) {
   for (const auto param : func->parameters()) {
     const auto param_name = param->getNameAsString();
     auto add_mmap_meta = [&](const string& name) {
+      std::string cat;
+      if (IsTapaType(param, "immap")) {
+        cat = "immap";
+      } else if (IsTapaType(param, "ommap")) {
+        cat = "ommap";
+      } else if (IsTapaType(param, "async_mmap")) {
+        cat = "async_mmap";
+      } else {
+        cat = "mmap";
+      }
       metadata["ports"].push_back(
           {{"name", name},
-           {"cat", IsTapaType(param, "async_mmap") ? "async_mmap" : "mmap"},
+           {"cat", cat},
            {"width",
             GetTypeWidth(GetTemplateArg(param->getType(), 0)->getAsType())},
            {"type", GetMmapElemType(param) + "*"}});
@@ -260,7 +283,8 @@ void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
             GetTypeWidth(GetTemplateArg(param->getType(), 0)->getAsType())},
            {"type", GetStreamElemType(param)}});
     };
-    if (IsTapaType(param, "(async_)?mmap")) {
+    if (IsTapaType(param, "(async_)?mmap") || IsTapaType(param, "immap") ||
+        IsTapaType(param, "ommap")) {
       add_mmap_meta(param_name);
     } else if (IsTapaType(param, "mmaps")) {
       for (int i = 0; i < GetArraySize(param); ++i) {
@@ -285,6 +309,28 @@ void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
                                    {"type", param->getType().getAsString()}});
     }
   }
+}
+
+// Apply tapa s2s transformations on a upper-level task.
+void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
+                                    const FunctionDecl* func) {
+  if (IsTapaTopLevel(func)) {
+    current_target->RewriteTopLevelFunc(func, GetRewriter());
+  } else {
+    current_target->RewriteMiddleLevelFunc(func, GetRewriter());
+  }
+
+  // The task metadata should only be obtained from the function definition
+  if (!func->isThisDeclarationADefinition()) return;
+  assert(task != nullptr);
+
+  // Obtain the connection schema from the task.
+  // metadata: {tasks, fifos}
+  // tasks: {task_name: [{step, {args: port_name: {var_type, var_name}}}]}
+  // fifos: {fifo_name: {depth, produced_by, consumed_by}}
+  auto& metadata = GetMetadata();
+  metadata["fifos"] = json::object();
+  ProcessTaskPorts(func, metadata);
 
   // Process stream declarations.
   unordered_map<string, const VarDecl*> fifo_decls;
@@ -323,6 +369,7 @@ void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
   for (auto invoke : invokes) {
     int step = -1;
     bool has_name = false;
+    bool has_executable = false;
     uint64_t vec_length = 1;
     if (const auto method = dyn_cast<CXXMethodDecl>(invoke->getCalleeDecl())) {
       auto args = method->getTemplateSpecializationArgs()->asArray();
@@ -383,6 +430,14 @@ void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
         const bool arg_is_int =
             arg->EvaluateAsInt(arg_eval_as_int_result, this->context_);
 
+        // skip if arg[i] is tapa::executable, which is used to specify the
+        // bitstream file of a task. if the task is being synthesized, the
+        // bitstream file of its sub-tasks should be simply ignored.
+        if (IsTapaType(arg, "executable")) {
+          has_executable = true;
+          continue;
+        }
+
         // element in an array
         auto op_call = dyn_cast<CXXOperatorCallExpr>(arg);
         if (op_call == nullptr) {
@@ -423,13 +478,15 @@ void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
                        std::to_string(uint64_t(
                            arg_eval_as_int_result.Val.getInt().getExtValue()));
           }
+
           if (i == 0) {
             task_name = arg_name;
             metadata["tasks"][task_name].push_back({{"step", step}});
             task = decl_ref->getDecl()->getAsFunction();
           } else {
             assert(task != nullptr);
-            auto param = task->getParamDecl(has_name ? i - 2 : i - 1);
+            auto skip_params = (has_name ? 1 : 0) + (has_executable ? 1 : 0);
+            auto param = task->getParamDecl(i - 1 - skip_params);
             auto param_name = param->getNameAsString();
             string param_cat;
 
@@ -479,6 +536,18 @@ void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
             };
             if (IsTapaType(param, "mmap")) {
               param_cat = "mmap";
+              // vector invocation can map mmaps to mmap
+              register_arg(
+                  get_name(arg_name, mmaps_access_pos[arg_name]++, decl_ref));
+
+            } else if (IsTapaType(param, "immap")) {
+              param_cat = "immap";
+              // vector invocation can map mmaps to mmap
+              register_arg(
+                  get_name(arg_name, mmaps_access_pos[arg_name]++, decl_ref));
+
+            } else if (IsTapaType(param, "ommap")) {
+              param_cat = "ommap";
               // vector invocation can map mmaps to mmap
               register_arg(
                   get_name(arg_name, mmaps_access_pos[arg_name]++, decl_ref));
@@ -584,6 +653,12 @@ void Visitor::ProcessUpperLevelTask(const ExprWithCleanups* task,
 // Apply tapa s2s transformations on a lower-level task.
 void Visitor::ProcessLowerLevelTask(const FunctionDecl* func) {
   current_target->RewriteLowerLevelFunc(func, GetRewriter());
+
+  // The task metadata should only be obtained from the function definition
+  if (!func->isThisDeclarationADefinition()) return;
+
+  auto& metadata = GetMetadata();
+  ProcessTaskPorts(func, metadata);
 }
 
 void Visitor::ProcessOtherFunc(const FunctionDecl* func) {

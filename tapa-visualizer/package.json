@@ -1,0 +1,24 @@
+{
+    "devDependencies": {
+        "@antv/g6": "^5.0.42",
+        "eslint": "^9.18.0",
+        "globals": "^15.14.0",
+        "patch-package": "^8.0.0",
+        "typescript": "^5.7.3",
+        "typescript-eslint": "^8.21.0"
+    },
+    "overrides": {
+        "@antv/g6": {
+            "hull.js": "andriiheonia/hull"
+        },
+        "patch-package@^8.0.0": {
+            "rimraf": "6.0.1"
+        }
+    },
+    "private": true,
+    "scripts": {
+        "postinstall": "patch-package"
+    },
+    "type": "module",
+    "version": "0.1.0"
+}
