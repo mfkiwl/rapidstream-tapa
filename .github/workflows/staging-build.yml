@@ -36,7 +36,7 @@ jobs:
       - name: Upload artifacts
         # @v3 is kept for compatibility with the nektosact
         # Should be upgraded to @v4 when the nektosact is updated
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: tapa
           path: ${{ github.workspace }}/artifacts.out/tapa.tar.gz
@@ -52,7 +52,13 @@ jobs:
       matrix:
         include:
           # Test all Vitis versions on the latest supported Ubuntu LTS.
-          # Ubuntu 24.04 is not supported by Xilinx yet.
+          # - os: ubuntu-24
+          #   xilinx_version: "2024.1"
+          # Ubuntu 24.04 is not supported by Xilinx yet for the same reason
+          # as Fedora 39+. Glibc has different identifier names than the
+          # ones Xilinx expects.
+          - os: ubuntu-22
+            xilinx_version: "2024.2"
           - os: ubuntu-22
             xilinx_version: "2024.1"
           - os: ubuntu-22
@@ -65,36 +71,36 @@ jobs:
             xilinx_version: "2022.1"
           # Test all OS versions with the latest Vitis version.
           - os: ubuntu-20
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: ubuntu-18
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: debian-10
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: debian-11
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: almalinux-9
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: rockylinux-9
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: fedora-38
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: fedora-37
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: fedora-36
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: fedora-35
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: fedora-34
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
           - os: amazonlinux-2023
-            xilinx_version: "2024.1"
+            xilinx_version: "2024.2"
 
     steps:
       - name: Checkout myself
         uses: actions/checkout@v4
 
       - name: Download artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: tapa
 
@@ -102,9 +108,10 @@ jobs:
         uses: ./.github/actions/run-command
         with:
           run: |
-            RAPIDSTREAM_LOCAL_PACKAGE=/workspace/tapa.tar.gz ./install.sh
+            RAPIDSTREAM_LOCAL_PACKAGE=/workspace/tapa.tar.gz ./install.sh -q
             export RAPIDSTREAM_TAPA_HOME=~/.rapidstream-tapa
             export PATH=~/.rapidstream-tapa/usr/bin:$PATH
+            export TAPA_CONCURRENCY=1
             source /opt/tools/xilinx/Vitis/${{ matrix.xilinx_version }}/settings64.sh
             bats -j $(nproc) tests/testsuite_self_test.bats
             find tests -name '*.bats' -print0 | xargs -0 bats -j $(nproc)

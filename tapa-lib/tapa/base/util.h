@@ -11,15 +11,6 @@
 #include <ostream>
 #include <type_traits>
 
-// FIXME: TAPA should provide its equivalence
-#ifndef ap_wait
-void ap_wait(void);
-#endif
-
-#ifndef ap_wait_n
-void ap_wait_n(int);
-#endif
-
 namespace tapa {
 
 namespace internal {
@@ -70,9 +61,6 @@ inline constexpr uint64_t round_up(uint64_t i) {
 template <typename To, typename From>
 inline typename std::enable_if<sizeof(To) == sizeof(From), To>::type  //
 bit_cast(From from) noexcept;
-
-template <typename T>
-T reg(T x);
 
 template <typename Addr, typename Payload>
 struct packet {

@@ -11,14 +11,16 @@ import os.path
 import re
 import subprocess
 from collections import defaultdict
+from collections.abc import Sequence
 from pathlib import Path
 
 from tapa import __version__
-from tapa.cosim.common import AXI
+from tapa.cosim.common import AXI, Arg
 from tapa.cosim.config_preprocess import preprocess_config
 from tapa.cosim.templates import (
     get_axi_ram_inst,
     get_axi_ram_module,
+    get_axis,
     get_begin,
     get_dut,
     get_end,
@@ -79,8 +81,6 @@ def parse_m_axi_interfaces(top_rtl_path: str) -> list[AXI]:
     param_to_value = dict(params)
 
     axi_list = []
-    assert len(match_addr) != 0, "No m_axi address channel found in the top RTL"
-    assert len(match_data) != 0, "No m_axi data channel found in the top RTL"
     name_to_addr_width = {m_axi: addr_width for addr_width, m_axi in match_addr}
     for data_width, m_axi in match_data:
         addr_width = name_to_addr_width[m_axi]
@@ -98,6 +98,7 @@ def get_cosim_tb(
     top_name: str,
     s_axi_control_path: str,
     axi_list: list[AXI],
+    args: Sequence[Arg],
     scalar_to_val: dict[str, str],
 ) -> str:
     """
@@ -113,9 +114,11 @@ def get_cosim_tb(
 
     tb += get_s_axi_control() + "\n"
 
-    tb += get_dut(top_name, axi_list) + "\n"
+    tb += get_axis(args) + "\n"
 
-    tb += get_test_signals(arg_to_reg_addrs, scalar_to_val, axi_list)
+    tb += get_dut(top_name, args) + "\n"
+
+    tb += get_test_signals(arg_to_reg_addrs, scalar_to_val, args)
 
     tb += get_end() + "\n"
 
@@ -138,19 +141,21 @@ def set_default_nettype(verilog_path: str) -> None:
                 f.write("`default_nettype wire\n" + content)
 
 
-if __name__ == "__main__":
+def main() -> None:  # pylint: disable=too-many-locals
+    """Main entry point for the TAPA fast cosim tool."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, required=True)
     parser.add_argument("--tb_output_dir", type=str, required=True)
+    parser.add_argument("--part_num", type=str, required=False)
     parser.add_argument("--launch_simulation", action="store_true")
-    parser.add_argument("--print_debug_info", action="store_true")
     parser.add_argument("--save_waveform", action="store_true")
     parser.add_argument("--start_gui", action="store_true")
+    parser.add_argument("--setup_only", action="store_true")
     args = parser.parse_args()
 
     _logger.info("TAPA fast cosim version: %s", __version__)
 
-    config = preprocess_config(args.config_path, args.tb_output_dir)
+    config = preprocess_config(args.config_path, args.tb_output_dir, args.part_num)
 
     top_name = config["top_name"]
     verilog_path = config["verilog_path"]
@@ -161,13 +166,19 @@ if __name__ == "__main__":
     set_default_nettype(verilog_path)
 
     axi_list = parse_m_axi_interfaces(top_path)
-    tb = get_cosim_tb(top_name, ctrl_path, axi_list, config["scalar_to_val"])
+    tb = get_cosim_tb(
+        top_name,
+        ctrl_path,
+        axi_list,
+        config["args"],
+        config["scalar_to_val"],
+    )
 
     # generate test bench RTL files
     Path(args.tb_output_dir).mkdir(parents=True, exist_ok=True)
     for bin_file in Path(args.tb_output_dir).glob("*.bin"):
         bin_file.unlink()
-    with open(f"{args.tb_output_dir}/tb.v", "w", encoding="utf-8") as fp:
+    with open(f"{args.tb_output_dir}/tb.sv", "w", encoding="utf-8") as fp:
         fp.write(tb)
     with open(f"{args.tb_output_dir}/fifo_srl_tb.v", "w", encoding="utf-8") as fp:
         fp.write(get_srl_fifo_template())
@@ -196,18 +207,37 @@ if __name__ == "__main__":
             "Use --save_waveform to save the simulation waveform."
         )
 
-    vivado_script = get_vivado_tcl(config, args.tb_output_dir, args.save_waveform)
+    vivado_script = get_vivado_tcl(
+        config,
+        args.tb_output_dir,
+        args.save_waveform,
+        args.start_gui,
+    )
 
     with open(f"{args.tb_output_dir}/run/run_cosim.tcl", "w", encoding="utf-8") as fp:
         fp.write("\n".join(vivado_script))
 
+    if args.setup_only:
+        _logger.info("User requested to only setup the cosim environment, exiting...")
+        return
+
     # launch simulation
-    disable_debug = "" if args.print_debug_info else " | grep -v DEBUG"
     mode = "gui" if args.start_gui else "batch"
-    command = ["vivado", "-mode", mode, "-source", "run_cosim.tcl", disable_debug]
+    command = ["vivado", "-mode", mode, "-source", "run_cosim.tcl"]
     if args.launch_simulation:
-        _logger.info("Vivado command: %s", command)
-        _logger.info("Starting Vivado...")
+        _logger.info("Running vivado command: %s", command)
         subprocess.run(
-            command, cwd=Path(f"{args.tb_output_dir}/run").resolve(), check=True
+            command,
+            cwd=Path(f"{args.tb_output_dir}/run").resolve(),
+            check=True,
+            env=os.environ
+            | {
+                "TAPA_FAST_COSIM_DPI_ARGS": ",".join(
+                    f"{k}:{v}" for k, v in config["axis_to_data_file"].items()
+                )
+            },
         )
+
+
+if __name__ == "__main__":
+    main()

@@ -8,6 +8,7 @@ RapidStream Contributor License Agreement.
 
 import logging
 import sys
+import tempfile
 
 import click
 
@@ -20,7 +21,7 @@ from tapa.steps.meta import compile_entry
 from tapa.steps.pack import pack
 from tapa.steps.synth import synth
 from tapa.steps.version import version
-from tapa.util import setup_logging
+from tapa.util import Options, setup_logging
 
 _logger = logging.getLogger().getChild(__name__)
 
@@ -49,25 +50,52 @@ _logger = logging.getLogger().getChild(__name__)
     help="Specify working directory.",
 )
 @click.option(
+    "--temp-dir",
+    metavar="DIR",
+    required=False,
+    type=click.Path(file_okay=False),
+    help="Specify temporary directory, which will be cleaned up after the execution",
+)
+@click.option(
+    "--clang-format-quota-in-bytes",
+    default=Options.clang_format_quota_in_bytes,
+    help="Limit clang-format to the first few bytes of code.",
+)
+@click.option(
     "--recursion-limit",
     default=3000,
     metavar="limit",
     help="Override Python recursion limit.",
 )
+@click.option(
+    "--enable-pyslang / --disable-pyslang",
+    type=bool,
+    default=Options.enable_pyslang,
+    help="Enable or disable pyslang (experimental).",
+)
+@click.version_option(__version__, prog_name="tapa")
 @click.pass_context
-def entry_point(
+def entry_point(  # noqa: PLR0913,PLR0917
     ctx: click.Context,
     verbose: bool,
     quiet: bool,
     work_dir: str,
+    temp_dir: str | None,
+    clang_format_quota_in_bytes: int,
     recursion_limit: int,
+    enable_pyslang: bool,
 ) -> None:
     """The TAPA compiler."""
     setup_logging(verbose, quiet, work_dir)
 
+    Options.clang_format_quota_in_bytes = clang_format_quota_in_bytes
+    Options.enable_pyslang = enable_pyslang
+
     # Setup execution context
     ctx.ensure_object(dict)
     switch_work_dir(work_dir)
+    if temp_dir is not None:
+        tempfile.tempdir = temp_dir
 
     # Print version information
     _logger.info("tapa version: %s", __version__)
@@ -86,4 +114,4 @@ entry_point.add_command(version)
 entry_point.add_command(gcc)
 
 if __name__ == "__main__":
-    entry_point()
+    entry_point(prog_name="tapa")

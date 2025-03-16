@@ -1,14 +1,12 @@
 """Core logic of TAPA."""
 
-from __future__ import annotations
-
 __copyright__ = """
 Copyright (c) 2024 RapidStream Design Automation, Inc. and contributors.
 All rights reserved. The contributor(s) of this file has/have agreed to the
 RapidStream Contributor License Agreement.
 """
 
-import collections
+import contextlib
 import decimal
 import glob
 import itertools
@@ -16,16 +14,21 @@ import json
 import logging
 import os
 import os.path
+import re
 import shutil
 import sys
 import tarfile
 import tempfile
 import zipfile
+from collections.abc import Generator
 from concurrent import futures
-from xml.etree import ElementTree
+from pathlib import Path
+from typing import NamedTuple
+from xml.etree import ElementTree as ET
 
 import toposort
 import yaml
+from psutil import cpu_count
 from pyverilog.vparser.ast import (
     Always,
     Assign,
@@ -36,8 +39,10 @@ from pyverilog.vparser.ast import (
     IntConst,
     Land,
     Minus,
+    Node,
     NonblockingSubstitution,
     Output,
+    Plus,
     PortArg,
     Reg,
     SingleStatement,
@@ -45,29 +50,31 @@ from pyverilog.vparser.ast import (
     SystemCall,
     Wire,
 )
+from pyverilog.vparser.parser import ParseError
 
-from tapa.backend.xilinx import RunHls
+from tapa.backend.xilinx import RunAie, RunHls
+from tapa.common.paths import find_resource
 from tapa.instance import Instance, Port
 from tapa.safety_check import check_mmap_arg_name
+from tapa.synthesis import ProgramSynthesisMixin
 from tapa.task import Task
 from tapa.util import (
+    Options,
     clang_format,
     get_instance_name,
     get_module_name,
-    get_vendor_include_paths,
-    nproc,
+    get_xpfm_path,
 )
 from tapa.verilog.ast_utils import (
     make_block,
     make_case_with_block,
     make_if_with_block,
-    make_int,
     make_operation,
     make_port_arg,
     make_width,
 )
-from tapa.verilog.util import Pipeline, wire_name
-from tapa.verilog.xilinx import ctrl_instance_name, generate_handshake_ports, pack
+from tapa.verilog.util import Pipeline, match_array_name, wire_name
+from tapa.verilog.xilinx import generate_handshake_ports, pack
 from tapa.verilog.xilinx.async_mmap import (
     ASYNC_MMAP_SUFFIXES,
     generate_async_mmap_ioports,
@@ -78,14 +85,8 @@ from tapa.verilog.xilinx.const import (
     CLK_SENS_LIST,
     DONE,
     FALSE,
-    HANDSHAKE_CLK,
-    HANDSHAKE_DONE,
-    HANDSHAKE_IDLE,
     HANDSHAKE_INPUT_PORTS,
     HANDSHAKE_OUTPUT_PORTS,
-    HANDSHAKE_READY,
-    HANDSHAKE_RST_N,
-    HANDSHAKE_START,
     IDLE,
     ISTREAM_SUFFIXES,
     OSTREAM_SUFFIXES,
@@ -97,7 +98,7 @@ from tapa.verilog.xilinx.const import (
     STATE,
     TRUE,
 )
-from tapa.verilog.xilinx.module import Module, generate_m_axi_ports
+from tapa.verilog.xilinx.module import Module, generate_m_axi_ports, get_streams_fifos
 
 _logger = logging.getLogger().getChild(__name__)
 
@@ -106,8 +107,141 @@ STATE01 = IntConst("2'b01")
 STATE11 = IntConst("2'b11")
 STATE10 = IntConst("2'b10")
 
+FIFO_DIRECTIONS = ["consumed_by", "produced_by"]
 
-class Program:  # noqa: PLR0904  # TODO: refactor this class
+
+def gen_declarations(task: Task) -> tuple[list[str], list[str], list[str]]:
+    """Generates kernel and port declarations."""
+    port_decl = [
+        f"input_plio p_{port.name};" if port.is_immap else f"output_plio p_{port.name};"
+        for port in task.ports.values()
+    ]
+    kernel_decl = [
+        f"kernel k_{name}{i};"
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+    header_decl = [f'#include "{name}.h"' for name in task.tasks]
+    return header_decl, kernel_decl, port_decl
+
+
+def gen_definitions(task: Task) -> tuple[list[str], ...]:
+    """Generates kernel and port definitions."""
+    kernel_def = [
+        f"k_{name}{i} = kernel::create({name});"
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+    kernel_source = [
+        f'source(k_{name}{i}) = "../../cpp/{name}.cpp";'
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+
+    kernel_header = [
+        f'//headers(k_{name}{i}) = {{"{name}.h"}};'
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+    kernel_header = []
+    kernel_runtime = [
+        f"runtime<ratio>(k_{name}{i}) = OCCUPANCY;"
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+    kernel_loc = [
+        f"//location<kernel>(k_{name}{i}) = tile(X, X);"
+        for name, insts in task.tasks.items()
+        for i in range(len(insts))
+    ]
+
+    port_def = [
+        f'p_{port.name} = input_plio::create("{port.name}",'
+        f' plio_{port.width}_bits, "{port.name}.txt");'
+        if port.is_immap
+        else f'p_{port.name} = output_plio::create("{port.name}",'
+        f' plio_{port.width}_bits, "{port.name}.txt");'
+        for port in task.ports.values()
+    ]
+    return (
+        kernel_def,
+        kernel_source,
+        kernel_header,
+        kernel_runtime,
+        kernel_loc,
+        port_def,
+    )
+
+
+def gen_connections(task: Task) -> list[str]:  # noqa: C901  # TODO: refactor this function
+    """Generates connections between ports and kernels."""
+    link_from_src = {}
+    link_to_dst = {}
+    for name, insts in task.tasks.items():
+        for i, inst in enumerate(insts):
+            arg_dict = inst["args"]
+            in_num = 0
+            out_num = 0
+            for conn_dict in arg_dict.values():
+                if conn_dict["cat"] == "istream":
+                    link_to_dst[conn_dict["arg"]] = [
+                        f"{name}{i}.in[{in_num}]",
+                        "net",
+                    ]
+                    in_num += 1
+                elif conn_dict["cat"] == "ostream":
+                    link_from_src[conn_dict["arg"]] = [
+                        f"{name}{i}.out[{out_num}]",
+                        "net",
+                    ]
+                    out_num += 1
+                elif conn_dict["cat"] == "immap":
+                    link_to_dst[conn_dict["arg"]] = [
+                        f"{name}{i}.in[{in_num}]",
+                        "io",
+                    ]
+                    in_num += 1
+                elif conn_dict["cat"] == "ommap":
+                    link_from_src[conn_dict["arg"]] = [
+                        f"{name}{i}.out[{out_num}]",
+                        "io",
+                    ]
+                    out_num += 1
+                else:
+                    msg = f"Unknown connection category: {conn_dict['cat']}"
+                    raise ValueError(msg)
+
+    connect_def = []
+    for name in task.fifos:
+        assert link_from_src[name][1] == "net", "FIFOs should be connected to/from net"
+        connect_def.append(
+            f"connect<stream> {name} (k_{link_from_src[name][0]},"
+            f" k_{link_to_dst[name][0]});"
+        )
+
+    for port in task.ports.values():
+        name = port.name
+        width = port.width
+        if name in link_from_src:
+            assert link_from_src[name][1] == "io", (
+                "Ports should be connected to/from io"
+            )
+            connect_def.append(
+                f"connect<window<{width}>> {name}_link"
+                f" (k_{link_from_src[name][0]}, p_{name}.in[0]);"
+            )
+
+        if name in link_to_dst:
+            assert link_to_dst[name][1] == "io", "Ports should be connected to/from io"
+            connect_def.append(
+                f"connect<window<{width}>> {name}_link"
+                f" (p_{name}.out[0], k_{link_to_dst[name][0]});"
+            )
+
+    return connect_def
+
+
+class Program(ProgramSynthesisMixin):  # noqa: PLR0904  # TODO: refactor this class
     """Describes a TAPA program.
 
     Attributes
@@ -118,10 +252,72 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
       toplevel_ports: Tuple of Port objects.
       _tasks: Dict mapping names of tasks to Task objects.
       files: Dict mapping file names to contents that appear in the HDL directory.
+      vitis_mode: Whether the generated RTL should match Vitis XO requirements.
 
     """
 
-    def __init__(self, obj: dict, work_dir: str | None = None) -> None:
+    GRAPH_HEADER_TEMPLATE = r"""
+#pragma once
+#include <adf.h>
+#include "common.h"
+#define OCCUPANCY 0.9
+using namespace adf;
+class {graph_name}: public graph
+{{
+private:
+    {kernel_decl}
+
+public:
+    {port_decl}
+
+    {graph_name}()
+	{{
+		// create kernel
+        {kernel_def}
+        {kernel_source}
+        {kernel_header}
+        {kernel_runtime}
+        {kernel_loc}
+
+		// create port
+        {port_def}
+
+		// connect port and kernel
+        {connect_def}
+	}};
+}};
+"""
+
+    GRAPH_CPP_TEMPLATE = r"""
+// Copyright 2024 RapidStream Design Automation, Inc.
+// All Rights Reserved.
+
+#include "{top_task_name}.h"
+
+using namespace adf;
+
+{top_task_name} my_graph;
+
+int main(int argc, char ** argv)
+{{
+	my_graph.init();
+#if defined(__X86SIM__)
+	my_graph.run(1);
+#else
+	my_graph.run();
+#endif
+	my_graph.end();
+	return 0;
+}}
+"""
+
+    def __init__(
+        self,
+        obj: dict,
+        vitis_mode: bool,
+        work_dir: str | None = None,
+        gen_templates: tuple[str, ...] = (),
+    ) -> None:
         """Construct Program object from a json file.
 
         Args:
@@ -129,11 +325,15 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
           obj: json object.
           work_dir: Specify a working directory as a string. If None, a temporary
               one will be created.
+          gen_templates: Tuple of task names that are templates. If a task is
+              specified as a template, its verilog module will only contains io
+              ports and no logic.
 
         """
         self.top: str = obj["top"]
         self.cflags = " ".join(obj.get("cflags", []))
         self.headers: dict[str, str] = obj.get("headers", {})
+        self.vitis_mode = vitis_mode
         if work_dir is None:
             self.work_dir = tempfile.mkdtemp(prefix="tapa-")
             self.is_temp = True
@@ -142,10 +342,18 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
             os.makedirs(self.work_dir, exist_ok=True)
             self.is_temp = False
         self.toplevel_ports = tuple(map(Port, obj["tasks"][self.top]["ports"]))
-        self._tasks: dict[str, Task] = collections.OrderedDict()
-        for name in toposort.toposort_flatten(
+        self._tasks: dict[str, Task] = {}
+
+        task_names = toposort.toposort_flatten(
             {k: set(v.get("tasks", ())) for k, v in obj["tasks"].items()},
-        ):
+        )
+        for template in gen_templates:
+            assert template in task_names, (
+                f"template task {template} not found in design"
+            )
+        self.gen_templates = gen_templates
+
+        for name in task_names:
             task_properties = obj["tasks"][name]
             task = Task(
                 name=name,
@@ -154,11 +362,20 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                 tasks=task_properties.get("tasks", {}),
                 fifos=task_properties.get("fifos", {}),
                 ports=task_properties.get("ports", []),
+                target_type=task_properties["target"],
             )
             if not task.is_upper or task.tasks:
                 self._tasks[name] = task
+
+            # add non-synthesizable tasks to gen_templates
+            if (
+                task_properties["target"] == "non_synthesizable"
+                and name not in self.gen_templates
+            ):
+                self.gen_templates += (name,)
+
         self.files: dict[str, str] = {}
-        self._hls_report_xmls: dict[str, ElementTree.ElementTree] = {}
+        self._hls_report_xmls: dict[str, ET.ElementTree] = {}
 
     def __del__(self) -> None:
         if self.is_temp:
@@ -173,24 +390,20 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
         return self._tasks[self.top]
 
     @property
-    def ctrl_instance_name(self) -> str:
-        return ctrl_instance_name(self.top)
-
-    @property
-    def register_level(self) -> int:
-        return self.top_task.module.register_level
-
-    @property
     def start_q(self) -> Pipeline:
-        return Pipeline(START.name, level=self.register_level)
+        return Pipeline(START.name)
 
     @property
     def done_q(self) -> Pipeline:
-        return Pipeline(DONE.name, level=self.register_level)
+        return Pipeline(DONE.name)
 
     @property
     def rtl_dir(self) -> str:
         return os.path.join(self.work_dir, "hdl")
+
+    @property
+    def template_dir(self) -> str:
+        return os.path.join(self.work_dir, "template")
 
     @property
     def report_dir(self) -> str:
@@ -202,11 +415,54 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
         os.makedirs(cpp_dir, exist_ok=True)
         return cpp_dir
 
+    @property
+    def report(self):
+        # ruff: noqa: ANN201
+        """Returns all formats of TAPA report as a namedtuple."""
+
+        class Report(NamedTuple):
+            json: str
+            yaml: str
+
+        return Report(
+            json=os.path.join(self.work_dir, "report.json"),
+            yaml=os.path.join(self.work_dir, "report.yaml"),
+        )
+
+    @staticmethod
+    def _get_custom_rtl_files(rtl_paths: tuple[Path, ...]) -> list[Path]:
+        custom_rtl: list[Path] = []
+        for path in rtl_paths:
+            if path.is_file():
+                custom_rtl.append(path)
+            elif path.is_dir():
+                rtl_files = list(path.rglob("*"))
+                if not rtl_files:
+                    msg = f"no rtl files found in {path}"
+                    raise ValueError(msg)
+                custom_rtl.extend(rtl_files)
+            elif path.exists():
+                msg = f"unsupported path: {path}"
+                raise ValueError(msg)
+            else:
+                msg = f"path does not exist: {path.absolute()}"
+                raise ValueError(msg)
+        return custom_rtl
+
     def get_task(self, name: str) -> Task:
         return self._tasks[name]
 
-    def get_cpp(self, name: str) -> str:
+    def get_cpp_path(self, name: str) -> str:
         return os.path.join(self.cpp_dir, name + ".cpp")
+
+    def get_common_path(self) -> str:
+        return os.path.join(self.cpp_dir, "common.h")
+
+    def get_header_path(self, name: str) -> str:
+        return os.path.join(self.cpp_dir, name + ".h")
+
+    def get_post_syn_rpt_path(self, module_name: str) -> str:
+        return os.path.join(self.report_dir, f"{module_name}.hier.util.rpt")
 
     def get_tar(self, name: str) -> str:
         os.makedirs(os.path.join(self.work_dir, "tar"), exist_ok=True)
@@ -218,11 +474,18 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
             (get_module_name(name) if prefix else name) + RTL_SUFFIX,
         )
 
-    def _get_hls_report_xml(self, name: str) -> ElementTree.ElementTree:
+    def get_rtl_template(self, name: str) -> str:
+        os.makedirs(self.template_dir, exist_ok=True)
+        return os.path.join(
+            self.template_dir,
+            name + RTL_SUFFIX,
+        )
+
+    def _get_hls_report_xml(self, name: str) -> ET.ElementTree:
         tree = self._hls_report_xmls.get(name)
         if tree is None:
             filename = os.path.join(self.report_dir, f"{name}_csynth.xml")
-            self._hls_report_xmls[name] = tree = ElementTree.parse(filename)
+            self._hls_report_xmls[name] = tree = ET.parse(filename)
         return tree
 
     def _get_part_num(self, name: str) -> str:
@@ -246,25 +509,57 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
         assert period.text
         return decimal.Decimal(period.text)
 
-    def extract_cpp(self) -> Program:
-        """Extract HLS C++ files."""
-        _logger.info("extracting HLS C++ files")
+    def extract_cpp(self, target: str = "hls") -> "Program":
+        """Extract HLS/AIE C++ files."""
+        _logger.info("extracting %s C++ files", target)
         check_mmap_arg_name(list(self._tasks.values()))
 
+        top_aie_task_is_done = False
         for task in self._tasks.values():
-            code_content = clang_format(task.code)
-            try:
-                with open(self.get_cpp(task.name), encoding="utf-8") as src_code:
-                    if src_code.read() == code_content:
-                        _logger.debug(
-                            "not updating %s since its content is up-to-date",
-                            src_code.name,
+            if task.name == self.top and target == "aie":
+                assert top_aie_task_is_done is False, (
+                    "There should be exactly one top-level task"
+                )
+                top_aie_task_is_done = True
+                code_content = self.get_aie_graph(task)
+                with open(
+                    self.get_header_path(task.name), "w", encoding="utf-8"
+                ) as src_code:
+                    src_code.write(code_content)
+                with open(
+                    self.get_cpp_path(task.name), "w", encoding="utf-8"
+                ) as src_code:
+                    src_code.write(
+                        self.GRAPH_CPP_TEMPLATE.format(top_task_name=self.top)
+                    )
+                with open(self.get_common_path(), "w", encoding="utf-8") as src_code:
+                    src_code.write(
+                        clang_format(task.code).replace(
+                            "#include <tapa.h>", "#include <adf.h>"
                         )
-                        continue
-            except FileNotFoundError:
-                pass
-            with open(self.get_cpp(task.name), "w", encoding="utf-8") as src_code:
-                src_code.write(code_content)
+                    )
+            else:
+                code_content = clang_format(task.code)
+                if target == "aie":
+                    code_content = code_content.replace(
+                        "#include <tapa.h>", "#include <adf.h>"
+                    )
+                try:
+                    with open(
+                        self.get_cpp_path(task.name), encoding="utf-8"
+                    ) as src_code:
+                        if src_code.read() == code_content:
+                            _logger.debug(
+                                "not updating %s since its content is up-to-date",
+                                src_code.name,
+                            )
+                            continue
+                except FileNotFoundError:
+                    pass
+                with open(
+                    self.get_cpp_path(task.name), "w", encoding="utf-8"
+                ) as src_code:
+                    src_code.write(code_content)
         for name, content in self.headers.items():
             header_path = os.path.join(self.cpp_dir, name)
             os.makedirs(os.path.dirname(header_path), exist_ok=True)
@@ -272,56 +567,80 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                 header_fp.write(content)
         return self
 
-    def run_hls(
+    def run_hls_or_aie(  # noqa: PLR0913,PLR0917,C901  # TODO: refactor this method
         self,
         clock_period: float | str,
         part_num: str,
         skip_based_on_mtime: bool = False,
         other_configs: str = "",
-    ) -> Program:
+        jobs: int | None = None,
+        keep_hls_work_dir: bool = False,
+        flow_type: str = "hls",
+        platform: str | None = None,
+    ) -> "Program":
         """Run HLS with extracted HLS C++ files and generate tarballs."""
-        self.extract_cpp()
+        self.extract_cpp(flow_type)
 
-        _logger.info("running HLS")
+        _logger.info("running %s", flow_type)
 
         def worker(task: Task, idx: int) -> None:
+            _logger.info("start worker for %s, target: %s", task.name, task.target_type)
             os.nice(idx % 19)
             try:
                 if skip_based_on_mtime and os.path.getmtime(
                     self.get_tar(task.name),
-                ) > os.path.getmtime(self.get_cpp(task.name)):
+                ) > os.path.getmtime(self.get_cpp_path(task.name)):
                     _logger.info(
                         "skipping HLS for %s since %s is newer than %s",
                         task.name,
                         self.get_tar(task.name),
-                        self.get_cpp(task.name),
+                        self.get_cpp_path(task.name),
                     )
                     return
             except OSError:
                 pass
-            hls_cflags = " ".join(
-                (
-                    self.cflags,
-                    "-DTAPA_TARGET_DEVICE_",
-                    "-DTAPA_TARGET_XILINX_HLS_",
-                    *(f"-isystem{x}" for x in get_vendor_include_paths()),
-                ),
-            )
-            with (
-                open(self.get_tar(task.name), "wb") as tarfileobj,
-                RunHls(
-                    tarfileobj,
-                    kernel_files=[(self.get_cpp(task.name), hls_cflags)],
-                    top_name=task.name,
-                    clock_period=str(clock_period),
-                    part_num=part_num,
-                    auto_prefix=True,
-                    hls="vitis_hls",
-                    std="c++17",
-                    other_configs=other_configs,
-                ) as proc,
-            ):
-                stdout, stderr = proc.communicate()
+            hls_defines = "-DTAPA_TARGET_DEVICE_ -DTAPA_TARGET_XILINX_HLS_"
+            # WORKAROUND: Vitis HLS requires -I or gflags cannot be found...
+            hls_includes = f"-I{find_resource('tapa-extra-runtime-include')}"
+            hls_cflags = f"{self.cflags} {hls_defines} {hls_includes}"
+            if flow_type == "hls":
+                with (
+                    open(self.get_tar(task.name), "wb") as tarfileobj,
+                    RunHls(
+                        tarfileobj,
+                        kernel_files=[(self.get_cpp_path(task.name), hls_cflags)],
+                        work_dir=f"{self.work_dir}/hls" if keep_hls_work_dir else None,
+                        top_name=task.name,
+                        clock_period=str(clock_period),
+                        part_num=part_num,
+                        auto_prefix=True,
+                        hls="vitis_hls",
+                        std="c++14",
+                        other_configs=other_configs,
+                    ) as proc,
+                ):
+                    stdout, stderr = proc.communicate()
+            elif flow_type == "aie":
+                if task.name != self.top:
+                    # For AIE flow, only the top-level task is synthesized
+                    return
+                assert platform is not None, "Platform must be specified for AIE flow."
+                with (
+                    open(self.get_tar(task.name), "wb") as tarfileobj,
+                    RunAie(
+                        tarfileobj,
+                        kernel_files=[self.get_cpp_path(task.name)],
+                        work_dir=f"{self.work_dir}/aie" if keep_hls_work_dir else None,
+                        top_name=task.name,
+                        clock_period=str(clock_period),
+                        xpfm=get_xpfm_path(platform),
+                    ) as proc,
+                ):
+                    stdout, stderr = proc.communicate()
+            else:
+                msg = f"Unknown flow type: {flow_type}"
+                raise ValueError(msg)
+
             if proc.returncode != 0:
                 if b"Pre-synthesis failed." in stdout and b"\nERROR:" not in stdout:
                     _logger.error(
@@ -332,20 +651,38 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                     return
                 sys.stdout.write(stdout.decode("utf-8"))
                 sys.stderr.write(stderr.decode("utf-8"))
-                msg = f"HLS failed for {task.name}"
-                raise RuntimeError(msg)
+                msg = f"{flow_type} failed for {task.name}"
 
-        worker_num = nproc()
+                # Neglect the dummy bug message from AIE 2022.2
+                aie_dummy_bug_msg = "/bin/sh: 1: [[: not found"
+                if aie_dummy_bug_msg not in stderr.decode("utf-8"):
+                    raise RuntimeError(msg)
+
+        jobs = jobs or cpu_count(logical=False)
         _logger.info(
-            "spawn %d workers for parallel HLS synthesis of the tasks",
-            worker_num,
+            "spawn %d workers for parallel %s synthesis of the tasks", jobs, flow_type
         )
-        with futures.ThreadPoolExecutor(max_workers=worker_num) as executor:
-            any(executor.map(worker, self._tasks.values(), itertools.count(0)))
+
+        try:
+            with futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+                any(executor.map(worker, self._tasks.values(), itertools.count(0)))
+        except RuntimeError:
+            if not keep_hls_work_dir:
+                _logger.error(
+                    "HLS failed, see above for details. You may use "
+                    "`--keep-hls-work-dir` to keep the HLS work directory "
+                    "for debugging."
+                )
+            else:
+                _logger.error(
+                    "HLS failed, see above for details. Please check the logs in %s",
+                    os.path.join(self.work_dir, "hls"),
+                )
+            sys.exit(1)
 
         return self
 
-    def generate_task_rtl(self, print_fifo_ops: bool) -> Program:
+    def generate_task_rtl(self, print_fifo_ops: bool) -> "Program":
         """Extract HDL files from tarballs generated from HLS."""
         _logger.info("extracting RTL files")
         for task in self._tasks.values():
@@ -382,7 +719,7 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
         _logger.info("parsing RTL files and populating tasks")
         for task, module in zip(
             self._tasks.values(),
-            futures.ProcessPoolExecutor().map(
+            (map if Options.enable_pyslang else futures.ProcessPoolExecutor().map)(
                 Module,
                 ([self.get_rtl(x.name)] for x in self._tasks.values()),
                 (not x.is_upper for x in self._tasks.values()),
@@ -399,11 +736,14 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
         _logger.info("instrumenting upper-level RTL")
         for task in self._tasks.values():
             if task.is_upper and task.name != self.top:
-                self._instrument_upper_task(task, print_fifo_ops)
+                self._instrument_upper_and_template_task(task, print_fifo_ops)
+            elif not task.is_upper and task.name in self.gen_templates:
+                assert task.ports
+                self._instrument_upper_and_template_task(task, print_fifo_ops)
 
         return self
 
-    def generate_top_rtl(self, print_fifo_ops: bool) -> Program:
+    def generate_top_rtl(self, print_fifo_ops: bool) -> "Program":
         """Instrument HDL files generated from HLS.
 
         Args:
@@ -415,26 +755,22 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
             Program: Return self.
 
         """
+        if self.top_task.name in self.gen_templates:
+            msg = "top task cannot be a template"
+            raise ValueError(msg)
+
         # instrument the top-level RTL
         _logger.info("instrumenting top-level RTL")
-        self._instrument_upper_task(
+        self._instrument_upper_and_template_task(
             self.top_task,
             print_fifo_ops,
         )
 
         _logger.info("generating report")
         task_report = self.top_task.report
-        with open(
-            os.path.join(self.work_dir, "report.yaml"),
-            "w",
-            encoding="utf-8",
-        ) as fp:
+        with open(self.report.yaml, "w", encoding="utf-8") as fp:
             yaml.dump(task_report, fp, default_flow_style=False, sort_keys=False)
-        with open(
-            os.path.join(self.work_dir, "report.json"),
-            "w",
-            encoding="utf-8",
-        ) as fp:
+        with open(self.report.json, "w", encoding="utf-8") as fp:
             json.dump(task_report, fp, indent=2)
 
         # self.files won't be populated until all tasks are instrumented
@@ -445,24 +781,39 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
 
         return self
 
-    def pack_rtl(self, output_file: str) -> Program:
+    def pack_rtl(self, output_file: str) -> "Program":
         _logger.info("packaging RTL code")
-        with open(output_file, "wb") as packed_obj:
+        with contextlib.ExitStack() as stack:  # avoid nested with statement
+            tmp_fp = stack.enter_context(tempfile.TemporaryFile())
             pack(
                 top_name=self.top,
                 ports=self.toplevel_ports,
                 rtl_dir=self.rtl_dir,
                 part_num=self._get_part_num(self.top),
-                output_file=packed_obj,
+                output_file=tmp_fp,
             )
+            tmp_fp.seek(0)
 
-        _logger.info("packaging HLS report")
-        with zipfile.ZipFile(output_file, "a", zipfile.ZIP_DEFLATED) as packed_obj:
+            _logger.info("packaging HLS report")
+            packed_obj = stack.enter_context(zipfile.ZipFile(tmp_fp, "a"))
+            output_fp = stack.enter_context(zipfile.ZipFile(output_file, "w"))
+            for filename in self.report:
+                arcname = os.path.basename(filename)
+                _logger.debug("  packing %s", arcname)
+                packed_obj.write(filename, arcname)
+
             report_glob = os.path.join(glob.escape(self.report_dir), "*_csynth.xml")
             for filename in glob.iglob(report_glob):
                 arcname = os.path.join("report", os.path.basename(filename))
                 _logger.debug("  packing %s", arcname)
                 packed_obj.write(filename, arcname)
+
+            # redact timestamp, source location etc. to make xo reproducible
+            for info in packed_obj.infolist():
+                redacted_info = zipfile.ZipInfo(info.filename)
+                redacted_info.compress_type = zipfile.ZIP_DEFLATED
+                redacted_info.external_attr = info.external_attr
+                output_fp.writestr(redacted_info, _redact(packed_obj, info))
 
         _logger.info("generated the v++ xo file at %s", output_file)
         return self
@@ -488,11 +839,14 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                         .module.get_port_of(fifo_port, suffix)
                         .width
                     )
+
                     wire = Wire(name=w_name, width=wire_width)
                     task.module.add_signals([wire])
 
             if task.is_fifo_external(fifo_name):
-                task.connect_fifo_externally(fifo_name, task.name == self.top)
+                task.connect_fifo_externally(
+                    fifo_name, task.name == self.top and self.vitis_mode
+                )
 
     def _instantiate_fifos(self, task: Task, print_fifo_ops: bool) -> None:
         _logger.debug("  instantiating FIFOs in %s", task.name)
@@ -518,7 +872,7 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
             task.module.add_fifo_instance(
                 name=fifo_name,
                 rst=RST,
-                width=self._get_fifo_width(task, fifo_name),
+                width=self.get_fifo_width(task, fifo_name),
                 depth=fifo["depth"],
             )
 
@@ -582,11 +936,12 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
         self,
         task: Task,
         width_table: dict[str, int],
+        ignore_peeks_fifos: tuple[str, ...] = (),
     ) -> list[Pipeline]:
         _logger.debug("  instantiating children tasks in %s", task.name)
         is_done_signals: list[Pipeline] = []
         arg_table: dict[str, Pipeline] = {}
-        async_mmap_args: dict[Instance.Arg, list[str]] = collections.OrderedDict()
+        async_mmap_args: dict[Instance.Arg, list[str]] = {}
 
         task.add_m_axi(width_table, self.files)
 
@@ -595,15 +950,6 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
             make_port_arg(x, x) for x in HANDSHAKE_INPUT_PORTS + HANDSHAKE_OUTPUT_PORTS
         ]
         fsm_upstream_module_ports = {}  # keyed by arg.name for deduplication
-        task.fsm_module.add_ports(
-            [
-                Input(HANDSHAKE_CLK),
-                Input(HANDSHAKE_RST_N),
-                Input(HANDSHAKE_START),
-                Output(HANDSHAKE_READY),
-                *(Output(x) for x in (HANDSHAKE_DONE, HANDSHAKE_IDLE)),
-            ]
-        )
 
         # Wires connecting to the downstream (task instances).
         fsm_downstream_portargs: list[PortArg] = []
@@ -633,7 +979,6 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                     # Instantiate a pipeline for the arg.
                     q = Pipeline(
                         name=instance.get_instance_arg(id_name),
-                        level=self.register_level,
                         width=width,
                     )
                     arg_table[arg.name] = q
@@ -696,10 +1041,7 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                         )
 
             # add start registers
-            start_q = Pipeline(
-                f"{instance.start.name}_global",
-                level=self.register_level,
-            )
+            start_q = Pipeline(f"{instance.start.name}_global")
             task.fsm_module.add_pipeline(start_q, self.start_q[0])
 
             if instance.is_autorun:
@@ -729,14 +1071,8 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                 )
             else:
                 # set up state
-                is_done_q = Pipeline(
-                    f"{instance.is_done.name}",
-                    level=self.register_level,
-                )
-                done_q = Pipeline(
-                    f"{instance.done.name}_global",
-                    level=self.register_level,
-                )
+                is_done_q = Pipeline(f"{instance.is_done.name}")
+                done_q = Pipeline(f"{instance.done.name}_global")
                 task.fsm_module.add_pipeline(is_done_q, instance.is_state(STATE10))
                 task.fsm_module.add_pipeline(done_q, self.done_q[0])
 
@@ -818,6 +1154,7 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                         instance.task.module.generate_istream_ports(
                             port=arg.port,
                             arg=arg.name,
+                            ignore_peek_fifos=ignore_peeks_fifos,
                         ),
                     )
                 elif arg.cat.is_ostream:
@@ -860,6 +1197,7 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
         )
         task.fsm_module.add_ports(fsm_upstream_module_ports.values())
         task.fsm_module.add_ports(fsm_downstream_module_ports)
+        task.add_rs_pragmas_to_fsm()
 
         # instantiate async_mmap modules at the upper levels
         # the base address may not be 0, so must use full 64 bit
@@ -897,13 +1235,9 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
         def set_state(state: IntConst) -> NonblockingSubstitution:
             return NonblockingSubstitution(left=STATE, right=state)
 
-        countdown = Identifier("countdown")
-        countdown_width = (self.register_level - 1).bit_length()
-
         module.add_signals(
             [
                 Reg(STATE.name, width=make_width(2)),
-                Reg(countdown.name, width=make_width(countdown_width)),
             ],
         )
 
@@ -931,29 +1265,8 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
                 (
                     STATE10,
                     [
-                        set_state(STATE11 if self.register_level else STATE00),
-                        NonblockingSubstitution(
-                            left=countdown,
-                            right=make_int(max(0, self.register_level - 1)),
-                        ),
+                        set_state(STATE00),
                     ],
-                ),
-                (
-                    STATE11,
-                    make_if_with_block(
-                        cond=Eq(
-                            left=countdown,
-                            right=make_int(0, width=countdown_width),
-                        ),
-                        true=set_state(STATE00),
-                        false=NonblockingSubstitution(
-                            left=countdown,
-                            right=Minus(
-                                left=countdown,
-                                right=make_int(1, width=countdown_width),
-                            ),
-                        ),
-                    ),
                 ),
             ],
         )
@@ -979,43 +1292,314 @@ class Program:  # noqa: PLR0904  # TODO: refactor this class
         module.add_pipeline(self.start_q, init=START)
         module.add_pipeline(self.done_q, init=is_state(STATE10))
 
-    def _instrument_upper_task(
+    def _instrument_upper_and_template_task(  # noqa: C901, PLR0912 # TODO: refactor this method
         self,
         task: Task,
         print_fifo_ops: bool,
     ) -> None:
         """Codegen for the top task."""
-        assert task.is_upper
+        # assert task.is_upper
         task.module.cleanup()
-        if task.name == self.top:
+        if task.name == self.top and self.vitis_mode:
             task.module.add_rs_pragmas()
-        task.add_rs_pragmas_to_fsm()
 
-        self._instantiate_fifos(task, print_fifo_ops)
-        self._connect_fifos(task)
-        width_table = {port.name: port.width for port in task.ports.values()}
-        is_done_signals = self._instantiate_children_tasks(
-            task,
-            width_table,
-        )
-        self._instantiate_global_fsm(task.fsm_module, is_done_signals)
+        # remove top level peek ports
+        top_fifos = set()
+        if task.name == self.top_task.name:
+            _logger.debug("remove top peek ports")
+            for port_name, port in task.ports.items():
+                if port.cat.is_istream:
+                    fifos = [port_name]
+                elif port.is_istreams:
+                    fifos = get_streams_fifos(task.module, port_name)
+                else:
+                    continue
+                for fifo in fifos:
+                    for suffix in ISTREAM_SUFFIXES:
+                        match = match_array_name(fifo)
+                        if match is None:
+                            peek_port = f"{fifo}_peek"
+                        else:
+                            peek_port = f"{match[0]}_peek[{match[1]}]"
 
-        with open(
-            self.get_rtl(task.fsm_module.name),
-            "w",
-            encoding="utf-8",
-        ) as rtl_code:
-            rtl_code.write(task.fsm_module.code)
+                        # Cannot use find_ports instead of get_port_of
+                        # since find port only check if the port name start with
+                        # the given fifo name and end with the suffix. This causes
+                        # wrong port being matched.
+                        # e.g. fifo = "a_fifo", suffix = "dout", find_ports will
+                        # match both "a_fifo_dout" and "a_fifo_ack_dout" even
+                        # though the latter has fifo name "a_fifo_ack" instead of
+                        # "a_fifo".
+                        try:
+                            task.module.get_port_of(peek_port, suffix)
+                        except Module.NoMatchingPortError:
+                            continue
+
+                        name = task.module.get_port_of(peek_port, suffix).name
+                        _logger.debug("  remove %s", name)
+                        task.module.del_port(name)
+                        top_fifos.add(fifo)
+
+        if task.name in self.gen_templates:
+            _logger.info("skip instrumenting template task %s", task.name)
+            if task.name in self.gen_templates:
+                with open(
+                    self.get_rtl_template(task.name), "w", encoding="utf-8"
+                ) as rtl_code:
+                    rtl_code.write(task.module.get_template_code())
+        else:
+            self._instantiate_fifos(task, print_fifo_ops)
+            self._connect_fifos(task)
+            width_table = {port.name: port.width for port in task.ports.values()}
+            is_done_signals = self._instantiate_children_tasks(
+                task,
+                width_table,
+                tuple(top_fifos),
+            )
+            self._instantiate_global_fsm(task.fsm_module, is_done_signals)
+
+            with open(
+                self.get_rtl(task.fsm_module.name),
+                "w",
+                encoding="utf-8",
+            ) as rtl_code:
+                rtl_code.write(task.fsm_module.code)
 
         # generate the top-level task
         with open(self.get_rtl(task.name), "w", encoding="utf-8") as rtl_code:
             rtl_code.write(task.module.code)
 
-    def _get_fifo_width(self, task: Task, fifo: str) -> int:
+    def get_fifo_width(self, task: Task, fifo: str) -> Node:
         producer_task, _, fifo_port = task.get_connection_to(fifo, "produced_by")
         port = self.get_task(producer_task).module.get_port_of(
             fifo_port,
             OSTREAM_SUFFIXES[0],
         )
         # TODO: err properly if not integer literals
-        return int(port.width.msb.value) - int(port.width.lsb.value) + 1
+        return Plus(Minus(port.width.msb, port.width.lsb), IntConst(1))
+
+    def replace_custom_rtl(
+        self, rtl_paths: tuple[Path, ...], templates_info: dict[str, list[str]]
+    ) -> None:
+        """Add custom RTL files to the project.
+
+        It will replace all files that originally exist in the project.
+
+        Args:
+            file_paths (List[Path]): List of file paths to copy.
+            destination_folder (Path): The target folder where files will be copied.
+        """
+        rtl_path = Path(self.rtl_dir)
+        assert Path.exists(rtl_path)
+
+        custom_rtl = self._get_custom_rtl_files(rtl_paths)
+        _logger.info("Adding custom RTL files to the project:")
+        for file_path in custom_rtl:
+            _logger.info("  %s", file_path)
+        self._check_custom_rtl_format(custom_rtl, templates_info)
+
+        for file_path in custom_rtl:
+            assert file_path.is_file()
+
+            # Determine destination path
+            dest_path = rtl_path / file_path.name
+
+            if dest_path.exists():
+                _logger.info("Replacing %s with custom RTL.", file_path.name)
+            else:
+                _logger.info("Adding custom RTL %s.", file_path.name)
+
+            # Copy file to destination, replacing if necessary
+            shutil.copy2(file_path, dest_path)
+
+    def get_rtl_templates_info(self) -> dict[str, list[str]]:
+        """Get the template information for each task.
+
+        Return:
+            dict[str, list[str]]: A dictionary where the key is the task
+            name and the value is the list of ports of the task.
+        """
+        return {
+            task: [str(port) for port in self._tasks[task].module.ports.values()]
+            for task in self.gen_templates
+        }
+
+    def _check_custom_rtl_format(
+        self, rtl_paths: list[Path], templates_info: dict[str, list[str]]
+    ) -> None:
+        """Check if the custom RTL files are in the correct format."""
+        if rtl_paths:
+            _logger.info("checking custom RTL files format")
+        for rtl_path in rtl_paths:
+            if rtl_path.suffix != ".v":
+                _logger.warning(
+                    "Skip checking custom rtl format for non-verilog file: %s",
+                    str(rtl_path),
+                )
+                continue
+            try:
+                rtl_module = Module([str(rtl_path)])
+            except ParseError:
+                msg = (
+                    f"Failed to parse custom RTL file: {rtl_path!s}. "
+                    "Skip port checking."
+                )
+                _logger.warning(msg)
+                continue
+            if (task := self._tasks.get(rtl_module.name)) is None:
+                continue  # ignore RTL modules that are not tasks
+            if {str(port) for port in rtl_module.ports.values()} == set(
+                templates_info[task.name]
+            ):
+                continue  # ports match exactly
+            msg = [
+                f"Custom RTL file {rtl_path} for task {task.name}"
+                " does not match the expected ports.",
+                "Task ports:",
+                *(f"  {port}" for port in templates_info[task.name]),
+                "Custom RTL ports:",
+                *(f"  {port}" for port in rtl_module.ports.values()),
+            ]
+            _logger.warning("\n".join(msg))
+
+    def get_aie_graph(self, task: Task) -> str:
+        """Generates the complete AIE graph code."""
+
+        _header_decl, kernel_decl, port_decl = gen_declarations(task)
+        (
+            kernel_def,
+            kernel_source,
+            kernel_header,
+            kernel_runtime,
+            kernel_loc,
+            port_def,
+        ) = gen_definitions(task)
+        connect_def = gen_connections(task)
+
+        return self.GRAPH_HEADER_TEMPLATE.format(
+            graph_name=self.top,
+            kernel_decl="\n\t".join(kernel_decl),
+            kernel_def="\n\t\t".join(kernel_def),
+            kernel_source="\n\t\t".join(kernel_source),
+            kernel_header="\n\t\t".join(kernel_header),
+            kernel_runtime="\n\t\t".join(kernel_runtime),
+            kernel_loc="\n\t\t".join(kernel_loc),
+            port_decl="\n\t".join(port_decl),
+            port_def="\n\t\t".join(port_def),
+            connect_def="\n\t\t".join(connect_def),
+        )
+
+    def _find_task_inst_hierarchy(
+        self,
+        target_task: str,
+        current_task: str,
+        current_inst: str,
+        current_hierarchy: tuple[str, ...],
+    ) -> Generator[tuple[str, ...]]:
+        """Find hierarchies of all instances of the given task name."""
+        if current_task == target_task:
+            yield (*current_hierarchy, current_inst)
+        for inst in self._tasks[current_task].instances:
+            assert inst.name
+            self._find_task_inst_hierarchy(
+                target_task,
+                inst.task.name,
+                inst.name,
+                (*current_hierarchy, current_inst),
+            )
+
+    @staticmethod
+    def get_inst_by_port_arg_name(
+        target_task: str | None, parent_task: Task, port_arg_name: str
+    ) -> Instance:
+        """Get the instance of the target task that connect to the port arg name.
+
+        If target_task is None, return the first instance that connects to the port arg
+        name. If target_task is not None, return the instance that connects to the port
+        arg name and is of the target task.
+        """
+        matched_inst = None
+        for inst in parent_task.instances:
+            if target_task and inst.task.name != target_task:
+                continue
+            for arg in inst.args:
+                if arg.name == port_arg_name:
+                    matched_inst = inst
+                    break
+        assert matched_inst is not None
+        return matched_inst
+
+    def get_grouping_constraints(
+        self, nonpipeline_fifos: list[str] | None = None
+    ) -> list[list[str]]:
+        """Generates the grouping constraints based on critical path."""
+        _logger.info("Resolving grouping constraints from non-pipeline FIFOs")
+
+        if not nonpipeline_fifos:
+            return []
+
+        grouping_constraints = []
+        for task_fifo_name in nonpipeline_fifos:
+            # dfs all tasks to find all task instances
+            task_name, fifo_name = tuple(task_fifo_name.split("."))
+            found_hierarchies = self._find_task_inst_hierarchy(
+                task_name, self.top, self.top, ()
+            )
+            fifo = self._tasks[task_name].fifos[fifo_name]
+            assert all(direction in fifo for direction in FIFO_DIRECTIONS)
+            consumer_task: str = fifo["consumed_by"][0]
+            producer_task: str = fifo["produced_by"][0]
+            for hierarchy in found_hierarchies:
+                # find fifo producer and consumer instance names as fifo object only
+                # contains task names
+                producer_inst = self.get_inst_by_port_arg_name(
+                    producer_task, self._tasks[task_name], fifo_name
+                ).name
+                consumer_inst = self.get_inst_by_port_arg_name(
+                    consumer_task, self._tasks[task_name], fifo_name
+                ).name
+
+                grouping_constraints.append(
+                    [
+                        "/".join((*hierarchy, producer_inst)),
+                        "/".join((*hierarchy, fifo_name)),
+                        "/".join((*hierarchy, consumer_inst)),
+                    ]
+                )
+
+        return grouping_constraints
+
+
+def _redact(xo: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    content = xo.read(info)
+    if not info.filename.endswith(".xml"):
+        return content
+
+    # Although we only redact xml files, regex substitution seems more readable
+    # than parsing and mutating xml. We'll add tests to prevent regression in
+    # case of file format change.
+    text = content.decode()
+
+    # Redact the timestamp stored in xml. The same timestamp is used by files in
+    # the xo zip file and is the earliest timestamp supported by the zip format.
+    text = re.sub(
+        r"<xilinx:coreCreationDateTime>....-..-..T..:..:..Z</xilinx:coreCreationDateTime>",
+        r"<xilinx:coreCreationDateTime>1980-01-01T00:00:00Z</xilinx:coreCreationDateTime>",
+        text,
+    )
+
+    # Redact the absolute path but keep the path relative to the work directory.
+    text = re.sub(
+        r"<SourceLocation>.*/(cpp/.*)</SourceLocation>",
+        r"<SourceLocation>\1</SourceLocation>",
+        text,
+    )
+
+    # Redact the random(?) project ID.
+    text = re.sub(
+        r'ProjectID="................................"',
+        r'ProjectID="0123456789abcdef0123456789abcdef"',
+        text,
+    )
+
+    return text.encode()

@@ -18,9 +18,12 @@ from pyverilog.vparser.ast import (
     Constant,
     Decl,
     Identifier,
+    Input,
     IntConst,
+    Output,
     ParamArg,
     Partselect,
+    Plus,
     Width,
     Wire,
 )
@@ -39,7 +42,10 @@ from tapa.verilog.xilinx.axis import (
 )
 from tapa.verilog.xilinx.const import (
     HANDSHAKE_CLK,
+    HANDSHAKE_DONE,
+    HANDSHAKE_IDLE,
     HANDSHAKE_OUTPUT_PORTS,
+    HANDSHAKE_READY,
     HANDSHAKE_RST,
     HANDSHAKE_RST_N,
     HANDSHAKE_START,
@@ -101,6 +107,7 @@ class Task:  # noqa: PLR0904
         tasks: dict[str, object] | None = None,
         fifos: dict[str, dict[str, dict[str, object]]] | None = None,
         ports: list[dict[str, str]] | None = None,
+        target_type: str | None = None,
     ) -> None:
         if isinstance(level, str):
             if level == "lower":
@@ -112,23 +119,37 @@ class Task:  # noqa: PLR0904
         self.level = level
         self.name: str = name
         self.code: str = code
-        self.tasks = collections.OrderedDict()
-        self.fifos = collections.OrderedDict()
+        self.tasks = {}
+        self.fifos = {}
+        self.target_type = target_type
+        port_dict = {i.name: i for i in map(Port, ports or [])}
         if self.is_upper:
-            self.tasks = collections.OrderedDict(
+            self.tasks = dict(
                 sorted(
                     (item for item in (tasks or {}).items()),
                     key=operator.itemgetter(0),
                 ),
             )
-            self.fifos = collections.OrderedDict(
+            self.fifos = dict(
                 sorted(
                     (item for item in (fifos or {}).items()),
                     key=operator.itemgetter(0),
                 ),
             )
-            self.ports = {i.name: i for i in map(Port, ports or [])}
+            self.ports = port_dict
             self.fsm_module = Module(name=f"{self.name}_fsm")
+            self.fsm_module.add_ports(
+                [
+                    Input(HANDSHAKE_CLK),
+                    Input(HANDSHAKE_RST_N),
+                    Input(HANDSHAKE_START),
+                    Output(HANDSHAKE_READY),
+                    *(Output(x) for x in (HANDSHAKE_DONE, HANDSHAKE_IDLE)),
+                ]
+            )
+        elif ports:
+            # Nonsynthesizable tasks need ports to generate template
+            self.ports = port_dict
         self.module = Module(name=self.name)
         self._instances: tuple[Instance, ...] | None = None
         self._args: dict[str, list[Instance.Arg]] | None = None
@@ -277,7 +298,8 @@ class Task:  # noqa: PLR0904
         if self._clock_period:
             return self._clock_period
         msg = f"clock period of task {self.name} not populated"
-        raise ValueError(msg)
+        _logger.warning(msg)
+        return decimal.Decimal(0)
 
     @clock_period.setter
     def clock_period(self, clock_period: decimal.Decimal) -> None:
@@ -378,9 +400,9 @@ class Task:  # noqa: PLR0904
             self.module.add_logics([Assign(left=b, right=a)])
 
     def convert_axis_to_fifo(self, axis_name: str) -> str:
-        assert (
-            len(self.get_fifo_directions(axis_name)) == 1
-        ), "axis interfaces should have one direction"
+        assert len(self.get_fifo_directions(axis_name)) == 1, (
+            "axis interfaces should have one direction"
+        )
         direction_axis = {
             "consumed_by": "produced_by",
             "produced_by": "consumed_by",
@@ -392,7 +414,7 @@ class Task:  # noqa: PLR0904
         self.module.add_fifo_instance(
             name=fifo_name,
             rst=RST,
-            width=data_width + 1,
+            width=Plus(IntConst(data_width), IntConst(1)),
             depth=2,
         )
 
@@ -445,13 +467,13 @@ class Task:  # noqa: PLR0904
 
         return fifo_name
 
-    def connect_fifo_externally(self, internal_name: str, top: bool) -> None:
-        assert (
-            len(self.get_fifo_directions(internal_name)) == 1
-        ), "externally connected fifos should have one direction"
+    def connect_fifo_externally(self, internal_name: str, axis: bool) -> None:
+        assert len(self.get_fifo_directions(internal_name)) == 1, (
+            "externally connected fifos should have one direction"
+        )
         direction = self.get_fifo_directions(internal_name)[0]
         external_name = (
-            self.convert_axis_to_fifo(internal_name) if top else internal_name
+            self.convert_axis_to_fifo(internal_name) if axis else internal_name
         )
 
         # connect fifo with external ports
@@ -460,8 +482,9 @@ class Task:  # noqa: PLR0904
                 rhs = self.module.get_port_of(external_name, suffix).name
             else:
                 rhs = wire_name(external_name, suffix)
+            internal_signal = Identifier(wire_name(internal_name, suffix))
             self.assign_directional(
-                Identifier(wire_name(internal_name, suffix)),
+                internal_signal,
                 Identifier(rhs),
                 STREAM_PORT_DIRECTION[suffix],
             )
@@ -620,7 +643,10 @@ class Task:  # noqa: PLR0904
             f"{x}={x}" for x in (HANDSHAKE_START, *HANDSHAKE_OUTPUT_PORTS)
         )
         scalar_regex_str = "|".join(
-            x.name for x in self.ports.values() if not x.cat.is_stream
+            x.name
+            for x in self.ports.values()
+            if x.name in self.fsm_module.ports  # skip unused ports
+            and (not x.cat.is_stream and not x.is_streams)  # TODO: refactor port.cat
         )
         scalar_pragma = f" scalar=({scalar_regex_str})" if scalar_regex_str else ""
         pragma_list = [
@@ -638,7 +664,7 @@ class Task:  # noqa: PLR0904
             if all(arg.cat.is_stream or "'d" in arg.name for arg in instance.args):
                 scalar_pragma = ""
             else:
-                scalar_pragma = f' scalar={instance.get_instance_arg(".*")}'
+                scalar_pragma = f" scalar={instance.get_instance_arg('.*')}"
             pragma_list.append(f"ap-ctrl {port_map_str}{scalar_pragma}")
         self.fsm_module.add_ports(
             [Decl([Identifier(f"// pragma RS {pragma}\n") for pragma in pragma_list])]

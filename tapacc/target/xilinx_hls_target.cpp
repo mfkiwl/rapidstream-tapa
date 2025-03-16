@@ -11,10 +11,15 @@
 #include <cctype>
 #include <string>
 
+#include <clang/Lex/Lexer.h>
+
+using clang::Lexer;
 using llvm::StringRef;
 
 namespace tapa {
 namespace internal {
+
+extern bool vitis_mode;
 
 static void AddDummyStreamRW(ADD_FOR_PARAMS_ARGS_DEF, bool qdma) {
   auto param_name = param->getNameAsString();
@@ -74,21 +79,71 @@ static void AddDummyMmapOrScalarRW(ADD_FOR_PARAMS_ARGS_DEF) {
   }
 }
 
+static void AddPragmaToBody(clang::Rewriter& rewriter, const clang::Stmt* body,
+                            std::string pragma) {
+  if (auto compound = llvm::dyn_cast<clang::CompoundStmt>(body)) {
+    rewriter.InsertTextAfterToken(compound->getLBracLoc(),
+                                  std::string("\n#pragma ") + pragma + "\n");
+  } else {
+    rewriter.InsertTextBefore(body->getBeginLoc(),
+                              std::string("_Pragma(\"") + pragma + "\")");
+  }
+}
+
+static void AddPragmaAfterStmt(clang::Rewriter& rewriter,
+                               const clang::Stmt* stmt, std::string pragma) {
+  rewriter.InsertTextAfterToken(stmt->getEndLoc(),
+                                std::string("\n#pragma ") + pragma + "\n");
+}
+
+static void AddPipelinePragma(clang::Rewriter& rewriter,
+                              const clang::TapaPipelineAttr* attr,
+                              const clang::Stmt* body) {
+  auto II = attr->getII();
+  std::string pragma = "HLS pipeline";
+  if (II) pragma += std::string(" II = ") + std::to_string(II);
+  AddPragmaToBody(rewriter, body, pragma);
+}
+
+static void AddStreamDepthPragma(clang::Rewriter& rewriter,
+                                 const clang::Stmt* stmt, std::string name,
+                                 int depth) {
+  std::string pragma = "HLS STREAM";
+  pragma += " variable = " + name + "._";
+  pragma += " depth = " + std::to_string(depth);
+  AddPragmaAfterStmt(rewriter, stmt, pragma);
+}
+
 void XilinxHLSTarget::AddCodeForTopLevelFunc(ADD_FOR_FUNC_ARGS_DEF) {
-  add_pragma({"HLS interface s_axilite port = return bundle = control"});
-  add_line("");
+  // Set top-level control to s_axilite for Vitis mode.
+  if (vitis_mode) {
+    add_pragma({"HLS interface s_axilite port = return bundle = control"});
+    add_line("");
+  }
 }
 
 void XilinxHLSTarget::AddCodeForTopLevelStream(ADD_FOR_PARAMS_ARGS_DEF) {
-  add_pragma({"HLS interface axis port =", param->getNameAsString()});
-  AddDummyStreamRW(ADD_FOR_PARAMS_ARGS, true);
+  if (vitis_mode) {
+    add_pragma({"HLS interface axis port =", param->getNameAsString()});
+    AddDummyStreamRW(ADD_FOR_PARAMS_ARGS, true);
+  } else {
+    AddCodeForMiddleLevelStream(ADD_FOR_PARAMS_ARGS);
+  }
 }
 
 void XilinxHLSTarget::AddCodeForTopLevelAsyncMmap(ADD_FOR_PARAMS_ARGS_DEF) {
+  if (!vitis_mode) {
+    add_line("#error top-level async_mmaps not supported in non-Vitis mode");
+    return;
+  }
   AddCodeForTopLevelMmap(ADD_FOR_PARAMS_ARGS);
 }
 
 void XilinxHLSTarget::AddCodeForTopLevelMmap(ADD_FOR_PARAMS_ARGS_DEF) {
+  if (!vitis_mode) {
+    add_line("#error top-level mmaps not supported in non-Vitis mode");
+    return;
+  }
   auto param_name = param->getNameAsString();
   if (IsTapaType(param, "((async_)?mmaps|hmap)")) {
     for (int i = 0; i < GetArraySize(param); ++i) {
@@ -103,9 +158,13 @@ void XilinxHLSTarget::AddCodeForTopLevelMmap(ADD_FOR_PARAMS_ARGS_DEF) {
 }
 
 void XilinxHLSTarget::AddCodeForTopLevelScalar(ADD_FOR_PARAMS_ARGS_DEF) {
-  add_pragma({"HLS interface s_axilite port =", param->getNameAsString(),
-              "bundle = control"});
-  AddDummyMmapOrScalarRW(ADD_FOR_PARAMS_ARGS);
+  if (vitis_mode) {
+    add_pragma({"HLS interface s_axilite port =", param->getNameAsString(),
+                "bundle = control"});
+    AddDummyMmapOrScalarRW(ADD_FOR_PARAMS_ARGS);
+  } else {
+    AddCodeForMiddleLevelScalar(ADD_FOR_PARAMS_ARGS);
+  }
 }
 
 void XilinxHLSTarget::AddCodeForMiddleLevelStream(ADD_FOR_PARAMS_ARGS_DEF) {
@@ -208,14 +267,33 @@ void XilinxHLSTarget::AddCodeForLowerLevelMmap(ADD_FOR_PARAMS_ARGS_DEF) {
 }
 
 void XilinxHLSTarget::RewriteTopLevelFunc(REWRITE_FUNC_ARGS_DEF) {
-  // We need a empty shell.
-  auto lines = GenerateCodeForTopLevelFunc(func);
-  rewriter.ReplaceText(func->getBody()->getSourceRange(),
-                       "{\n" + llvm::join(lines, "\n") + "}\n");
+  if (vitis_mode) {
+    // We need a empty shell for the top-level function body so that TAPA
+    // can use the shell to connect the subtasks.
+    if (func->isThisDeclarationADefinition()) {
+      auto lines = GenerateCodeForTopLevelFunc(func);
+      rewriter.ReplaceText(func->getBody()->getSourceRange(),
+                           "{\n" + llvm::join(lines, "\n") + "}\n");
+    }
 
-  // SDAccel only works with extern C kernels.
-  rewriter.InsertText(func->getBeginLoc(), "extern \"C\" {\n\n");
-  rewriter.InsertTextAfterToken(func->getEndLoc(), "\n\n}  // extern \"C\"\n");
+    // Vitis only works with extern C kernels. We need to wrap the kernel
+    // with extern C.
+    auto beginLoc = func->getBeginLoc();
+    auto endLoc = func->getEndLoc();
+
+    // If the function is a signature, we need to insert after the semicolon.
+    if (!func->isThisDeclarationADefinition()) {
+      endLoc = Lexer::findLocationAfterToken(endLoc, clang::tok::semi,
+                                             rewriter.getSourceMgr(),
+                                             rewriter.getLangOpts(), true);
+    }
+
+    rewriter.InsertText(beginLoc, "extern \"C\" {\n\n");
+    rewriter.InsertTextAfterToken(endLoc, "\n\n}  // extern \"C\"\n");
+  } else {
+    // Otherwise, treat it as a normal HLS kernel.
+    RewriteMiddleLevelFunc(REWRITE_FUNC_ARGS);
+  }
 }
 
 void XilinxHLSTarget::RewriteMiddleLevelFunc(REWRITE_FUNC_ARGS_DEF) {
@@ -224,26 +302,43 @@ void XilinxHLSTarget::RewriteMiddleLevelFunc(REWRITE_FUNC_ARGS_DEF) {
                        "{\n" + llvm::join(lines, "\n") + "}\n");
 }
 
-void XilinxHLSTarget::RewriteFuncArguments(const clang::FunctionDecl* func,
-                                           clang::Rewriter& rewriter,
-                                           bool top) {
-  bool qdma_header_inserted = false;
+static void RewriteStreamDefinitions(REWRITE_FUNC_ARGS_DEF) {
+  for (const auto child : func->getBody()->children()) {
+    if (const auto decl_stmt = llvm::dyn_cast<clang::DeclStmt>(child)) {
+      if (const auto var_decl =
+              llvm::dyn_cast<clang::VarDecl>(*decl_stmt->decl_begin())) {
+        if (auto decl = GetTapaStreamDecl(var_decl->getType())) {
+          const auto args = decl->getTemplateArgs().asArray();
+          const uint64_t fifo_depth{*args[1].getAsIntegral().getRawData()};
+          AddStreamDepthPragma(rewriter, decl_stmt, var_decl->getNameAsString(),
+                               fifo_depth);
+        }
+      }
+      // TODO: Support streams
+    }
+  }
+}
 
+void XilinxHLSTarget::RewriteLowerLevelFunc(REWRITE_FUNC_ARGS_DEF) {
+  auto lines = GenerateCodeForLowerLevelFunc(func);
+  rewriter.InsertTextAfterToken(func->getBody()->getBeginLoc(),
+                                llvm::join(lines, "\n"));
+  RewriteStreamDefinitions(REWRITE_FUNC_ARGS);
+}
+
+void XilinxHLSTarget::RewriteOtherFunc(REWRITE_FUNC_ARGS_DEF) {
+  BaseTarget::RewriteOtherFunc(REWRITE_FUNC_ARGS);
+  RewriteStreamDefinitions(REWRITE_FUNC_ARGS);
+}
+
+void XilinxHLSTarget::RewriteTopLevelFuncArguments(REWRITE_FUNC_ARGS_DEF) {
+  RewriteMiddleLevelFuncArguments(REWRITE_FUNC_ARGS);
+
+  bool qdma_header_inserted = false;
   // Replace mmaps arguments with 64-bit base addresses.
   for (const auto param : func->parameters()) {
-    const std::string param_name = param->getNameAsString();
-    if (IsTapaType(param, "(async_)?mmap")) {
-      rewriter.ReplaceText(
-          param->getTypeSourceInfo()->getTypeLoc().getSourceRange(),
-          "uint64_t ");
-    } else if (IsTapaType(param, "((async_)?mmaps|hmap)")) {
-      std::string rewritten_text;
-      for (int i = 0; i < GetArraySize(param); ++i) {
-        if (!rewritten_text.empty()) rewritten_text += ", ";
-        rewritten_text += "uint64_t " + GetArrayElem(param_name, i);
-      }
-      rewriter.ReplaceText(param->getSourceRange(), rewritten_text);
-    } else if (top && IsTapaType(param, "(i|o)stream")) {
+    if (IsTapaType(param, "(i|o)stream") && vitis_mode) {
+      // For Vitis mode, replace istream and ostream with qdma_axis.
       // TODO: support streams
       int width =
           param->getASTContext()
@@ -263,58 +358,34 @@ void XilinxHLSTarget::RewriteFuncArguments(const clang::FunctionDecl* func,
   }
 }
 
-static clang::SourceRange ExtendAttrRemovalRange(clang::Rewriter& rewriter,
-                                                 clang::SourceRange range) {
-  auto begin = range.getBegin();
-  auto end = range.getEnd();
-
-#define BEGIN(OFF) (begin.getLocWithOffset(OFF))
-#define END(OFF) (end.getLocWithOffset(OFF))
-#define STR_AT(BEGIN, END) \
-  (rewriter.getRewrittenText(clang::SourceRange((BEGIN), (END))))
-#define IS_IGNORE(STR) ((STR) == "" || std::isspace((STR)[0]))
-
-  // Find the true end of the token
-  for (; std::isalpha(STR_AT(END(1), END(1))[0]); end = END(1));
-
-  // Remove all whitespaces around the attribute
-  for (; IS_IGNORE(STR_AT(BEGIN(-1), BEGIN(-1))); begin = BEGIN(-1));
-  for (; IS_IGNORE(STR_AT(END(1), END(1))); end = END(1));
-
-  // Remove comma if around the attribute
-  if (STR_AT(BEGIN(-1), BEGIN(-1)) == ",") {
-    begin = BEGIN(-1);
-  } else if (STR_AT(END(1), END(1)) == ",") {
-    end = END(1);
-  } else if (STR_AT(BEGIN(-2), BEGIN(-1)) == "[[" &&
-             STR_AT(END(1), END(2)) == "]]") {
-    // Check if the attribute is completely removed
-    begin = BEGIN(-2);
-    end = END(2);
-  }
-
-  return clang::SourceRange(begin, end);
-}
-
-static void AddPragmaToBody(clang::Rewriter& rewriter, const clang::Stmt* body,
-                            std::string pragma) {
-  if (auto compound = llvm::dyn_cast<clang::CompoundStmt>(body)) {
-    rewriter.InsertTextAfterToken(compound->getLBracLoc(),
-                                  std::string("\n#pragma ") + pragma + "\n");
-  } else {
-    rewriter.InsertTextBefore(body->getBeginLoc(),
-                              std::string("_Pragma(\"") + pragma + "\")");
+void XilinxHLSTarget::RewriteMiddleLevelFuncArguments(REWRITE_FUNC_ARGS_DEF) {
+  // Replace mmaps arguments with 64-bit base addresses.
+  for (const auto param : func->parameters()) {
+    const std::string param_name = param->getNameAsString();
+    if (IsTapaType(param, "(async_)?mmap")) {
+      rewriter.ReplaceText(
+          param->getTypeSourceInfo()->getTypeLoc().getSourceRange(),
+          "uint64_t");
+    } else if (IsTapaType(param, "((async_)?mmaps|hmap)")) {
+      std::string rewritten_text;
+      for (int i = 0; i < GetArraySize(param); ++i) {
+        if (!rewritten_text.empty()) rewritten_text += ", ";
+        rewritten_text += "uint64_t " + GetArrayElem(param_name, i);
+      }
+      rewriter.ReplaceText(param->getSourceRange(), rewritten_text);
+    }
   }
 }
-
-static void AddPipelinePragma(clang::Rewriter& rewriter,
-                              const clang::TapaPipelineAttr* attr,
-                              const clang::Stmt* body) {
-  auto II = attr->getII();
-  std::string pragma = "HLS pipeline";
-  if (II) pragma += std::string(" II = ") + std::to_string(II);
-  AddPragmaToBody(rewriter, body, pragma);
+void XilinxHLSTarget::ProcessNonCurrentTask(const clang::FunctionDecl* func,
+                                            clang::Rewriter& rewriter,
+                                            bool IsTopTapaTopLevel) {
+  // Remove the function body.
+  if (func->hasBody()) {
+    auto range = func->getBody()->getSourceRange();
+    rewriter.ReplaceText(range, ";");
+  }
 }
+void XilinxHLSTarget::RewriteOtherFuncArguments(REWRITE_FUNC_ARGS_DEF) {}
 
 void XilinxHLSTarget::RewritePipelinedDecl(REWRITE_DECL_ARGS_DEF,
                                            const clang::Stmt* body) {

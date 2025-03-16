@@ -4,14 +4,17 @@
 # All rights reserved. The contributor(s) of this file has/have agreed to the
 # RapidStream Contributor License Agreement.
 
+load("@rules_python//python:defs.bzl", "py_library")
 load("@tapa_deps//:requirements.bzl", "requirement")
 
 py_library(
     name = "verilog",
-    srcs = glob(["**/*.py"]),
+    srcs = glob(["*.py"]),
     visibility = ["//tapa:__subpackages__"],
     deps = [
+        "//tapa:util",
         "//tapa/backend",
+        "//tapa/verilog/xilinx",
         requirement("jinja2"),
         requirement("pyverilog"),
     ],

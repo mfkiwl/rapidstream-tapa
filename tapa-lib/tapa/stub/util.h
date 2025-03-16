@@ -6,13 +6,22 @@
 
 #include "tapa/base/util.h"
 
+// FIXME: TAPA should provide its equivalence
+#ifndef ap_wait
+void ap_wait(void);
+#endif
+
+#ifndef ap_wait_n
+void ap_wait_n(int);
+#endif
+
 namespace tapa {
 
 template <typename To, typename From>
 inline typename std::enable_if<sizeof(To) == sizeof(From), To>::type  //
 bit_cast(From from) noexcept;
 
-template <typename T>
+template <typename T, size_t Depth = 1>
 T reg(T x);
 
 }  // namespace tapa

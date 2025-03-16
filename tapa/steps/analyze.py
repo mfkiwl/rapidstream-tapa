@@ -19,7 +19,7 @@ from pathlib import Path
 import click
 
 from tapa.common.graph import Graph as TapaGraph
-from tapa.common.paths import find_resource
+from tapa.common.paths import find_resource, get_tapa_cflags
 from tapa.core import Program
 from tapa.steps.common import (
     get_work_dir,
@@ -70,18 +70,34 @@ _logger = logging.getLogger().getChild(__name__)
         "leaf-level tasks instantiated in the top module"
     ),
 )
+@click.option(
+    "--vitis-mode / --no-vitis-mode",
+    type=bool,
+    default=True,
+    help=(
+        "`--vitis-mode` (default) will generate .xo files for Vitis "
+        "`v++` command, with AXI4-Lite interfaces for task arguments "
+        "and return values, and AXI4-Stream interfaces for task FIFOs; "
+        "`--no-vitis-mode` will only generate RTL code with Vitis HLS "
+        "compatible interfaces"
+    ),
+)
 def analyze(
     input_files: tuple[str, ...],
     top: str,
     cflags: tuple[str, ...],
     flatten_hierarchy: bool,
+    vitis_mode: bool,
 ) -> None:
     """Analyze TAPA program and store the program description."""
-    tapacc = find_clang_binary("tapacc")
-    tapa_cpp = find_clang_binary("tapa-cpp")
+    tapacc = find_clang_binary("tapacc-binary")
+    tapa_cpp = find_clang_binary("tapa-cpp-binary")
 
     work_dir = get_work_dir()
-    cflags += ("-std=c++17",)
+    # Vitis HLS only supports until C++14. If the flag sets to C++17, gcc's
+    # header files will use C++17 features, such as type inference in
+    # template argument deduction, which is not supported by Vitis HLS.
+    cflags += ("-std=c++14",)
 
     tapacc_cflags, system_cflags = find_tapacc_cflags(cflags)
     flatten_files = run_flatten(
@@ -92,6 +108,7 @@ def analyze(
         flatten_files,
         top,
         tapacc_cflags + system_cflags,
+        vitis_mode,
     )
     graph_dict["cflags"] = tapacc_cflags
 
@@ -100,11 +117,10 @@ def analyze(
     if flatten_hierarchy:
         tapa_graph = tapa_graph.get_flatten_graph()
     graph_dict = tapa_graph.to_dict()
-
-    store_tapa_program(Program(graph_dict, work_dir))
+    store_tapa_program(Program(graph_dict, vitis_mode, work_dir))
 
     store_persistent_context("graph", graph_dict)
-    store_persistent_context("settings", {})
+    store_persistent_context("settings", {"vitis-mode": vitis_mode})
 
     is_pipelined("analyze", True)
 
@@ -173,37 +189,29 @@ def find_tapacc_cflags(
       click.UsageError: Unable to find the include folders.
 
     """
-    # Add TAPA include files to tapacc cflags
-    tapa_include = find_resource("tapa-lib")
-    if tapa_include is None:
-        _logger.error("unable to find tapa include folder")
-        sys.exit(-1)
-    tapa_extra_runtime_include = find_resource("tapa-extra-runtime-include")
-    if tapa_extra_runtime_include is None:
-        _logger.error("unable to find tapa runtime include folder")
-        sys.exit(-1)
-
     # Add vendor include files to tapacc cflags
     vendor_include_paths = ()
     for vendor_path in get_vendor_include_paths():
-        vendor_include_paths += ("-isystem", vendor_path)
+        vendor_include_paths += ("-isystem" + vendor_path,)
         _logger.info("added vendor include path `%s`", vendor_path)
 
     # Add system include files to tapacc cflags
     system_includes = []
     system_include_path = find_resource("tapa-system-include")
     if system_include_path:
-        system_includes.extend(["-isystem", str(system_include_path)])
+        system_includes.extend(["-isystem" + str(system_include_path)])
 
-    # WORKAROUND: -DNDEBUG is added to disable assertions in the generated
-    #             code, which are not be supported by the HLS tool.
+    # TODO: Vitis HLS highly depends on the assert to be defined in
+    #       the system include path in a certain way. One attempt was
+    #       to disable NDEBUG but this causes hls::assume to fail.
+    #       A full solution is to provide tapa::assume that guarantees
+    #       the produce the pattern that HLS likes.
+    #       For now, newer versions of glibc will not be supported.
     return (
         cflags[:]
-        + ("-DNDEBUG",)
         # Use the stdc++ library from the HLS toolchain.
         + ("-nostdinc++",)
-        + ("-isystem", str(tapa_include))
-        + ("-isystem", str(tapa_extra_runtime_include))
+        + get_tapa_cflags()
         + vendor_include_paths,
         tuple(system_includes),
     )
@@ -228,9 +236,10 @@ def run_and_check(cmd: tuple[str, ...]) -> str:
         check=False,
     )
     if proc.returncode != 0:
+        quoted_cmd = " ".join(f'"{arg}"' if " " in arg else arg for arg in cmd)
         _logger.error(
             "command %s failed with exit code %d",
-            cmd,
+            quoted_cmd,
             proc.returncode,
         )
         sys.exit(proc.returncode)
@@ -290,6 +299,8 @@ def run_flatten(
                 #        synthesis-specific macros, as the macros will be
                 #        expanded by clang cpp.
                 "-D__SYNTHESIS__",
+                "-DAESL_SYN",
+                "-DAP_AUTOCC",
                 "-DTAPA_TARGET_DEVICE_",
                 "-DTAPA_TARGET_STUB_",
                 *cflags,
@@ -307,6 +318,7 @@ def run_tapacc(
     files: tuple[str, ...],
     top: str,
     cflags: tuple[str, ...],
+    vitis_mode: bool,
 ) -> dict:
     """Execute tapacc and return the program description.
 
@@ -315,6 +327,7 @@ def run_tapacc(
       tapacc: The path of the tapacc binary.
       files: C/C++ files to flatten.
       cflags: User specified CFLAGS with TAPA specific headers.
+      vitis_mode: Insert Vitis compatible interfaces or not.
 
     Returns:
     -------
@@ -324,12 +337,14 @@ def run_tapacc(
     tapacc_args = (
         "-top",
         top,
+        *(("-vitis",) if vitis_mode else ()),
         "--",
         *cflags,
         "-DTAPA_TARGET_DEVICE_",
         "-DTAPA_TARGET_STUB_",
     )
     tapacc_cmd = (tapacc, *files, *tapacc_args)
-    _logger.info("Running tapacc command: %s", " ".join(tapacc_cmd))
+    quoted_cmd = " ".join(f'"{arg}"' if " " in arg else arg for arg in tapacc_cmd)
+    _logger.info("running tapacc command: %s", quoted_cmd)
 
     return json.loads(run_and_check(tapacc_cmd))

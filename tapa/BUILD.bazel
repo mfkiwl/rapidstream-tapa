@@ -5,10 +5,13 @@
 # RapidStream Contributor License Agreement.
 
 load("@rules_pkg//pkg:mappings.bzl", "pkg_attributes", "pkg_filegroup", "pkg_files", "pkg_mklink", "strip_prefix")
+load("@rules_python//python:defs.bzl", "py_library")
 load("@rules_python//python:packaging.bzl", "py_wheel")
 load("@rules_python//python:pip.bzl", "compile_pip_requirements")
+load("@rules_python//python:py_binary.bzl", "py_binary")
 load("@tapa_deps//:requirements.bzl", "requirement")
 load("//bazel:nuitka_rules.bzl", "nuitka_binary")
+load("//bazel:pytest_rules.bzl", "py_test")
 
 package(default_visibility = ["//tapa:__subpackages__"])
 
@@ -20,7 +23,7 @@ compile_pip_requirements(
 
 nuitka_binary(
     name = "nuitka",
-    src = ":__main__.py",
+    src = ":tapa",
     flags = [
         "--deployment",
         "--include-package-data=pyverilog",
@@ -28,29 +31,22 @@ nuitka_binary(
         # -c is used by tapa but nuitka incorrectly marks it as self-execution
         "--no-deployment-flag=self-execution",
         # ply depends on docstrings so no_docstrings is not an option
-        "--python-flag=isolated,no_site,no_warnings",
+        "--python-flag=isolated,no_site",
     ],
-    nuitka_environment = ":tapa-nuitka-env.py",
     output_name = "tapa-bin",
-)
-
-py_binary(
-    name = "tapa-nuitka-env.py",
-    srcs = ["//bazel:nuitka_wrapper.py"],
-    main = "nuitka_wrapper.py",
-    deps = [
-        requirement("nuitka"),
-        ":tapa-py-libs",
-    ],
 )
 
 py_binary(
     name = "tapa",
     srcs = ["__main__.py"],
     data = [
+        "//fpga-runtime:include",
+        "//fpga-runtime:pkg-extra-runtime-deps",
+        "//fpga-runtime:pkg-lib",
         "//tapa-cpp",
         "//tapa-lib:include",
-        "//tapa-lib:tapa",
+        "//tapa-lib:pkg-extra-runtime-deps",
+        "//tapa-lib:pkg-lib",
         "//tapa-system-include",
         "//tapa-system-include:tapa-extra-runtime-include",
     ],
@@ -74,13 +70,8 @@ py_wheel(
 
 py_library(
     name = "tapa-py-libs",
-    srcs = [
-        "__init__.py",
-    ],
-    data = [
-        ":VERSION",
-    ],
     deps = [
+        ":__init__",
         ":core",
         ":instance",
         ":safety_check",
@@ -95,15 +86,31 @@ py_library(
 )
 
 py_library(
+    name = "__init__",
+    srcs = ["__init__.py"],
+    data = [
+        ":VERSION",
+    ],
+)
+
+py_library(
+    name = "abc",
+    srcs = ["abc.py"],
+)
+
+py_library(
     name = "core",
     srcs = ["core.py"],
     deps = [
         ":instance",
         ":safety_check",
+        ":synthesis",
         ":task",
         ":util",
         "//tapa/backend",
         "//tapa/verilog",
+        "//tapa/verilog/xilinx:module",
+        requirement("psutil"),
         requirement("pyverilog"),
         requirement("pyyaml"),
         requirement("toposort"),
@@ -129,14 +136,34 @@ py_library(
 )
 
 py_library(
+    name = "synthesis",
+    srcs = ["synthesis.py"],
+    deps = [
+        ":abc",
+        "//tapa/backend",
+        requirement("psutil"),
+    ],
+)
+
+py_library(
     name = "task",
     srcs = ["task.py"],
     deps = [
+        ":__init__",
         ":instance",
         ":util",
         "//tapa/backend",
         "//tapa/verilog",
+        "//tapa/verilog/xilinx:module",
         requirement("pyverilog"),
+    ],
+)
+
+py_test(
+    name = "task_test",
+    srcs = ["task_test.py"],
+    deps = [
+        ":task",
     ],
 )
 
@@ -145,6 +172,14 @@ py_library(
     srcs = ["util.py"],
     deps = [
         requirement("coloredlogs"),
+    ],
+)
+
+py_test(
+    name = "util_test",
+    srcs = ["util_test.py"],
+    deps = [
+        ":util",
     ],
 )
 

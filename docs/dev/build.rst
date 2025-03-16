@@ -22,6 +22,8 @@ To build TAPA from source, you need:
 - `Bazel <https://bazel.build>`_ 7.3.2 or later
 - `Binutils <https://www.gnu.org/software/binutils/>`_ 2.30 or later
 - `Git <https://git-scm.com>`_
+- `Libstdc++ <https://gcc.gnu.org/libstdc++/>`_ matching the most recent GCC
+  version installed on your system
 - `Python <https://www.python.org>`_ 3.6 or later
 - :ref:`Other TAPA dependencies <user/installation:System Prerequisites>`
 
@@ -89,6 +91,13 @@ name. For instance, to build only the TAPA compiler:
 
    To view all available targets, run ``bazel query //...``.
 
+To skip building for the tests, you could use:
+
+.. code-block:: bash
+
+   bazel build //... -- -//tests/...
+
+
 After the build process completes, you can find the compiled binaries in the
 ``bazel-bin`` directory. For example, the TAPA compiler binary is located at
 ``bazel-bin/tapa/tapa``.
@@ -98,8 +107,6 @@ After the build process completes, you can find the compiled binaries in the
    The build process duration may vary depending on your system's performance.
    LLVM, a significant dependency used by TAPA for code generation, requires
    considerable time to build. Bazel will cache it after the initial build.
-   However, if your build environment changes (e.g., sourcing a different Vivado
-   settings script), Bazel might need to rebuild LLVM.
 
 Use the Built TAPA
 ------------------
@@ -125,10 +132,6 @@ TAPA compiler or runtime library to ensure you're using the latest version.
 
 Run TAPA Tests
 --------------
-
-.. important::
-
-   Source the Vivado settings script before running the tests.
 
 To run all TAPA tests, including unit tests and integration tests, use the
 following command in the repository's root directory:

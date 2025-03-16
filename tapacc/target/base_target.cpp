@@ -21,6 +21,9 @@ void BaseTarget::AddCodeForMiddleLevelStream(ADD_FOR_PARAMS_ARGS_DEF) {
 void BaseTarget::AddCodeForLowerLevelStream(ADD_FOR_PARAMS_ARGS_DEF) {
   AddCodeForStream(ADD_FOR_PARAMS_ARGS);
 }
+void BaseTarget::AddCodeForOtherStream(ADD_FOR_PARAMS_ARGS_DEF) {
+  AddCodeForStream(ADD_FOR_PARAMS_ARGS);
+}
 
 void BaseTarget::AddCodeForAsyncMmap(ADD_FOR_PARAMS_ARGS_DEF) {}
 void BaseTarget::AddCodeForTopLevelAsyncMmap(ADD_FOR_PARAMS_ARGS_DEF) {
@@ -30,6 +33,9 @@ void BaseTarget::AddCodeForMiddleLevelAsyncMmap(ADD_FOR_PARAMS_ARGS_DEF) {
   AddCodeForAsyncMmap(ADD_FOR_PARAMS_ARGS);
 }
 void BaseTarget::AddCodeForLowerLevelAsyncMmap(ADD_FOR_PARAMS_ARGS_DEF) {
+  AddCodeForAsyncMmap(ADD_FOR_PARAMS_ARGS);
+}
+void BaseTarget::AddCodeForOtherAsyncMmap(ADD_FOR_PARAMS_ARGS_DEF) {
   AddCodeForAsyncMmap(ADD_FOR_PARAMS_ARGS);
 }
 
@@ -43,6 +49,9 @@ void BaseTarget::AddCodeForMiddleLevelMmap(ADD_FOR_PARAMS_ARGS_DEF) {
 void BaseTarget::AddCodeForLowerLevelMmap(ADD_FOR_PARAMS_ARGS_DEF) {
   AddCodeForMmap(ADD_FOR_PARAMS_ARGS);
 }
+void BaseTarget::AddCodeForOtherMmap(ADD_FOR_PARAMS_ARGS_DEF) {
+  AddCodeForMmap(ADD_FOR_PARAMS_ARGS);
+}
 
 void BaseTarget::AddCodeForScalar(ADD_FOR_PARAMS_ARGS_DEF) {}
 void BaseTarget::AddCodeForTopLevelScalar(ADD_FOR_PARAMS_ARGS_DEF) {
@@ -52,6 +61,9 @@ void BaseTarget::AddCodeForMiddleLevelScalar(ADD_FOR_PARAMS_ARGS_DEF) {
   AddCodeForScalar(ADD_FOR_PARAMS_ARGS);
 }
 void BaseTarget::AddCodeForLowerLevelScalar(ADD_FOR_PARAMS_ARGS_DEF) {
+  AddCodeForScalar(ADD_FOR_PARAMS_ARGS);
+}
+void BaseTarget::AddCodeForOtherScalar(ADD_FOR_PARAMS_ARGS_DEF) {
   AddCodeForScalar(ADD_FOR_PARAMS_ARGS);
 }
 
@@ -129,6 +141,60 @@ std::vector<std::string> BaseTarget::GenerateCodeForLowerLevelFunc(
   return lines;
 }
 
+std::vector<std::string> BaseTarget::GenerateCodeForOtherFunc(
+    const clang::FunctionDecl* func) {
+  std::vector<std::string> lines = {""};
+  LINES_FUNCTIONS;
+
+  for (const auto param : func->parameters()) {
+    if (IsTapaType(param, "(i|o)streams?")) {
+      AddCodeForOtherStream(param, add_line, add_pragma);
+    } else if (IsTapaType(param, "async_mmaps?")) {
+      AddCodeForOtherAsyncMmap(param, add_line, add_pragma);
+    } else if (IsTapaType(param, "(mmaps?|hmap)")) {
+      AddCodeForOtherMmap(param, add_line, add_pragma);
+    } else {
+      AddCodeForOtherScalar(param, add_line, add_pragma);
+    }
+    add_line("");  // Separate each parameter.
+  }
+
+  return lines;
+}
+
+clang::SourceRange BaseTarget::ExtendAttrRemovalRange(
+    clang::Rewriter& rewriter, clang::SourceRange range) {
+  auto begin = range.getBegin();
+  auto end = range.getEnd();
+
+#define BEGIN(OFF) (begin.getLocWithOffset(OFF))
+#define END(OFF) (end.getLocWithOffset(OFF))
+#define STR_AT(BEGIN, END) \
+  (rewriter.getRewrittenText(clang::SourceRange((BEGIN), (END))))
+#define IS_IGNORE(STR) ((STR) == "" || std::isspace((STR)[0]))
+
+  // Find the true end of the token
+  for (; std::isalpha(STR_AT(END(1), END(1))[0]); end = END(1));
+
+  // Remove all whitespaces around the attribute
+  for (; IS_IGNORE(STR_AT(BEGIN(-1), BEGIN(-1))); begin = BEGIN(-1));
+  for (; IS_IGNORE(STR_AT(END(1), END(1))); end = END(1));
+
+  // Remove comma if around the attribute
+  if (STR_AT(BEGIN(-1), BEGIN(-1)) == ",") {
+    begin = BEGIN(-1);
+  } else if (STR_AT(END(1), END(1)) == ",") {
+    end = END(1);
+  } else if (STR_AT(BEGIN(-2), BEGIN(-1)) == "[[" &&
+             STR_AT(END(1), END(2)) == "]]") {
+    // Check if the attribute is completely removed
+    begin = BEGIN(-2);
+    end = END(2);
+  }
+
+  return clang::SourceRange(begin, end);
+}
+
 void BaseTarget::RewriteTopLevelFunc(REWRITE_FUNC_ARGS_DEF) {
   auto lines = GenerateCodeForTopLevelFunc(func);
   rewriter.InsertTextAfterToken(func->getBody()->getBeginLoc(),
@@ -139,13 +205,19 @@ void BaseTarget::RewriteMiddleLevelFunc(REWRITE_FUNC_ARGS_DEF) {
   rewriter.InsertTextAfterToken(func->getBody()->getBeginLoc(),
                                 llvm::join(lines, "\n"));
 }
-void BaseTarget::RewriteLowerLevelFunc(REWRITE_FUNC_ARGS_DEF) {
-  auto lines = GenerateCodeForLowerLevelFunc(func);
+void BaseTarget::RewriteLowerLevelFunc(REWRITE_FUNC_ARGS_DEF) {}
+void BaseTarget::RewriteOtherFunc(REWRITE_FUNC_ARGS_DEF) {
+  auto lines = GenerateCodeForOtherFunc(func);
   rewriter.InsertTextAfterToken(func->getBody()->getBeginLoc(),
                                 llvm::join(lines, "\n"));
 }
 
-void BaseTarget::RewriteFuncArguments(REWRITE_FUNC_ARGS_DEF, bool top) {}
+void BaseTarget::RewriteTopLevelFuncArguments(REWRITE_FUNC_ARGS_DEF) {}
+void BaseTarget::RewriteMiddleLevelFuncArguments(REWRITE_FUNC_ARGS_DEF) {}
+void BaseTarget::RewriteLowerLevelFuncArguments(REWRITE_FUNC_ARGS_DEF) {}
+void BaseTarget::RewriteOtherFuncArguments(REWRITE_FUNC_ARGS_DEF) {}
+void BaseTarget::ProcessNonCurrentTask(REWRITE_FUNC_ARGS_DEF,
+                                       bool IsTopTapaTopLevel) {}
 void BaseTarget::RewritePipelinedDecl(REWRITE_DECL_ARGS_DEF,
                                       const clang::Stmt* body) {}
 void BaseTarget::RewritePipelinedStmt(REWRITE_STMT_ARGS_DEF,

@@ -19,7 +19,6 @@
 #include "frt/arg_info.h"
 #include "frt/device.h"
 #include "frt/devices/opencl_device_matcher.h"
-#include "frt/stream_wrapper.h"
 #include "frt/tag.h"
 
 namespace fpga {
@@ -33,6 +32,7 @@ class OpenclDevice : public Device {
 
   void Exec() override;
   void Finish() override;
+  bool IsFinished() const override;
 
   std::vector<ArgInfo> GetArgsInfo() const override;
   int64_t LoadTimeNanoSeconds() const override;

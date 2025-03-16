@@ -8,12 +8,16 @@
 #include "tapa/base/task.h"
 
 #include "tapa/host/coroutine.h"
+#include "tapa/host/internal_util.h"
 #include "tapa/host/logging.h"
 
 #include <sys/wait.h>
+#include <unistd.h>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -25,7 +29,7 @@ namespace internal {
 
 template <typename Param, typename Arg>
 struct accessor {
-  static Param access(Arg&& arg) { return arg; }
+  static Param access(Arg&& arg, bool) { return arg; }
   static void access(fpga::Instance& instance, int& idx, Arg&& arg) {
     instance.SetArg(idx++, static_cast<Param>(arg));
   }
@@ -33,7 +37,7 @@ struct accessor {
 
 template <typename T>
 struct accessor<T, seq> {
-  static T access(seq&& arg) { return arg.pos++; }
+  static T access(seq&& arg, bool) { return arg.pos++; }
   static void access(fpga::Instance& instance, int& idx, seq&& arg) {
     instance.SetArg(idx++, static_cast<T>(arg.pos++));
   }
@@ -42,16 +46,29 @@ struct accessor<T, seq> {
 void* allocate(size_t length);
 void deallocate(void* addr, size_t length);
 
-template <typename T>
-struct invoker;
+// std::bind wrapper with arguments evaluated from left to right.
+struct binder {
+  template <typename F, typename... Args>
+  binder(F&& f, Args&&... args)
+      : result(std::bind(std::forward<F>(f), std::forward<Args>(args)...)) {}
+  std::function<void()> result;
+};
 
-template <typename... Params>
-struct invoker<void (&)(Params...)> {
+template <typename F>
+struct invoker {
+  using FuncType = std::decay_t<F>;
+  using Params = typename function_traits<FuncType>::params;
+
+  static_assert(
+      std::is_same_v<void, typename function_traits<FuncType>::return_type>,
+      "task function must return void");
+
   template <typename... Args>
-  static void invoke(int mode, void (&f)(Params...), Args&&... args) {
-    // std::bind creates a copy of args
-    auto functor = std::bind(
-        f, accessor<Params, Args>::access(std::forward<Args>(args))...);
+  static void invoke(int mode, F&& f, Args&&... args) {
+    // Create a functor that captures args by value
+    auto functor = invoker::functor_with_accessors(
+        mode > 0, std::forward<F>(f), std::index_sequence_for<Args...>{},
+        std::forward<Args>(args)...);
     if (mode > 0) {  // Sequential scheduling.
       std::move(functor)();
     } else {
@@ -60,7 +77,7 @@ struct invoker<void (&)(Params...)> {
   }
 
   template <typename... Args>
-  static int64_t invoke(bool run_in_new_process, void (&f)(Params...),
+  static int64_t invoke(bool run_in_new_process, F&& f,
                         const std::string& bitstream, Args&&... args) {
     if (bitstream.empty()) {
       LOG(INFO) << "running software simulation with TAPA library";
@@ -94,24 +111,59 @@ struct invoker<void (&)(Params...)> {
     }
   }
 
+  template <typename Func, size_t... Is, typename... CapturedArgs>
+  static void set_fpga_args(fpga::Instance& instance, Func&& func,
+                            std::index_sequence<Is...>,
+                            CapturedArgs&&... args) {
+    int idx = 0;
+    int _[] = {
+        (accessor<std::tuple_element_t<Is, Params>, CapturedArgs>::access(
+             instance, idx, std::forward<CapturedArgs>(args)),
+         0)...};
+  }
+
  private:
   template <typename... Args>
-  static int64_t invoke(void (&f)(Params...), const std::string& bitstream,
-                        Args&&... args) {
+  static int64_t invoke(F&& f, const std::string& bitstream, Args&&... args) {
     auto instance = fpga::Instance(bitstream);
-    int idx = 0;
-    int _[] = {(
-        accessor<Params, Args>::access(instance, idx, std::forward<Args>(args)),
-        0)...};
+    set_fpga_args(instance, std::forward<F>(f),
+                  std::index_sequence_for<Args...>{},
+                  std::forward<Args>(args)...);
     instance.WriteToDevice();
     instance.Exec();
     instance.ReadFromDevice();
     instance.Finish();
     return instance.ComputeTimeNanoSeconds();
   }
+
+  template <typename Func, size_t... Is, typename... CapturedArgs>
+  static auto functor_with_accessors(bool is_sequential, Func&& func,
+                                     std::index_sequence<Is...>,
+                                     CapturedArgs&&... args) {
+    // std::bind creates a copy of args
+    // Aggregate initialization evaluates args from left to right.
+    return binder{
+        func, accessor<std::tuple_element_t<Is, Params>, CapturedArgs>::access(
+                  std::forward<CapturedArgs>(args), is_sequential)...}
+        .result;
+  }
 };
 
 }  // namespace internal
+
+/// Enables overriding the executable target for `tapa::task::invoke`.
+class executable {
+ public:
+  explicit executable(std::string path) : path_(std::move(path)) {}
+
+  // Not copyable or movable.
+  executable(const executable& other) = delete;
+  executable& operator=(const executable& other) = delete;
+
+ private:
+  friend class task;
+  const std::string path_;
+};
 
 /// Defines a parent task instantiating children task instances.
 ///
@@ -173,12 +225,34 @@ struct task {
   template <int mode, typename Func, typename... Args, size_t name_size>
   task& invoke(Func&& func, const char (&name)[name_size], Args&&... args) {
     static_assert(
-        std::is_function_v<typename std::remove_reference_t<Func>>,
-        "the first argument for tapa::task::invoke() must be a function");
+        internal::is_callable_v<typename std::remove_reference_t<Func>>,
+        "the first argument for tapa::task::invoke() must be callable");
     internal::invoker<Func>::template invoke<Args...>(
         mode_override.value_or(mode), std::forward<Func>(func),
         std::forward<Args>(args)...);
     return *this;
+  }
+
+  /// Host-only invoke that takes an @c executable as an argument.
+  ///
+  /// NOTE: This `invoke` must be called before any direct `tapa::stream` reader
+  /// / writer; otherwise `tapa::stream` will not bind correctly.
+  ///
+  /// @param func Task function definition of the instantiated child.
+  /// @param exe  Optionally overrides the execution target.
+  /// @param args Arguments passed to @c func.
+  /// @return     Reference to the caller @c tapa::task.
+  template <typename Func, typename... Args>
+  task& invoke(Func&& func, executable exe, Args&&... args) {
+    if (exe.path_.empty()) {
+      return invoke(std::forward<Func>(func), std::forward<Args>(args)...);
+    }
+
+    auto instance = std::make_shared<fpga::Instance>(exe.path_);
+    internal::invoker<Func>::set_fpga_args(*instance, std::forward<Func>(func),
+                                           std::index_sequence_for<Args...>{},
+                                           std::forward<Args>(args)...);
+    return invoke_frt(std::move(instance));
   }
 
   /// Invokes a task @c n times and instantiates @c n child task
@@ -205,6 +279,9 @@ struct task {
 
  protected:
   std::optional<int> mode_override;
+
+ private:
+  task& invoke_frt(std::shared_ptr<fpga::Instance> instance);
 };
 
 }  // namespace tapa

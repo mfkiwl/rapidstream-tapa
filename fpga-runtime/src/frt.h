@@ -21,7 +21,8 @@
 #include "frt/buffer.h"
 #include "frt/device.h"
 #include "frt/stream.h"
-#include "frt/stream_wrapper.h"
+#include "frt/stream_arg.h"
+#include "frt/stringify.h"  // IWYU pragma: export
 #include "frt/tag.h"
 
 namespace fpga {
@@ -52,12 +53,16 @@ PlaceholderBuffer<T> Placeholder(T* ptr, size_t n) {
   return PlaceholderBuffer<T>(ptr, n);
 }
 
-using ReadStream = internal::Stream<internal::Tag::kReadOnly>;
-using WriteStream = internal::Stream<internal::Tag::kWriteOnly>;
+template <typename T>
+using Stream = internal::Stream<T, internal::Tag::kReadWrite>;
 
 class Instance {
  public:
   Instance(const std::string& bitstream);
+
+  // Move-only.
+  Instance(Instance&&) = default;
+  Instance& operator=(Instance&&) = default;
 
   // Sets a scalar argument.
   template <typename T>
@@ -72,8 +77,8 @@ class Instance {
   }
 
   // Sets a stream argument.
-  template <internal::Tag tag>
-  void SetArg(int index, internal::Stream<tag>& arg) {
+  template <typename T, internal::Tag tag>
+  void SetArg(int index, internal::Stream<T, tag>& arg) {
     device_->SetStreamArg(index, tag, arg);
   }
 
@@ -99,6 +104,9 @@ class Instance {
   // Waits for the program to finish.
   void Finish();
 
+  // Returns whether the program has finished.
+  bool IsFinished() const;
+
   // Invokes the program on the device. This is a shortcut for `SetArgs`,
   // `WriteToDevice`, `Exec`, `ReadFromDevice`, and if there is no stream
   // arguments, `Finish` as well.
@@ -111,7 +119,7 @@ class Instance {
     bool has_stream = false;
     bool _[sizeof...(Args)] = {(
         has_stream |=
-        std::is_base_of<internal::StreamWrapper,
+        std::is_base_of<internal::StreamArg,
                         typename std::remove_reference<Args>::type>::value)...};
     ConditionallyFinish(has_stream);
     return *this;

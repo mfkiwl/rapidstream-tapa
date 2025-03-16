@@ -212,9 +212,9 @@ clock cycle, a decision must be made regarding which packet to prioritize.
 
 This decision-making process needs to occur before removing any tokens from
 the input channels (streams). The code accomplishes this by first peeking at
-the input stream using :ref:`peek <classtapa_1_1istream_1a6df8ab2e1caaaf2e32844b7cc716cf11>`
-to examine the destinations without consuming the data. Based on these peeked
-destinations, it determines which inputs can be processed.
+the input stream using `peek` to examine the destinations without consuming
+the data. Based on these peeked destinations, it determines which inputs can
+be processed.
 
 .. note::
 
@@ -476,9 +476,10 @@ In the ``InnerStage`` function:
 .. warning::
 
    TAPA does not support accessing individual streams or memory-mapped
-   interfaces from a ``streams`` or ``mmaps`` array. For example, ``in_q0[0]``
-   will not compile. Instead, use ``tapa::invoke<..., n>`` to distribute the
-   array elements across multiple invocations.
+   interfaces from a ``streams`` or ``mmaps`` array, unless it is in the leaf
+   level of the task invocation hierarchy. For example, ``in_q0[0]`` will not
+   compile. Instead, use ``tapa::invoke<..., n>`` to distribute the array
+   elements across multiple invocations.
 
 .. note::
 
@@ -558,7 +559,9 @@ Basic Usage
 
 ``async_mmap`` should be used only as formal parameters in leaf-level tasks.
 It can be constructed from ``mmap``, and an ``mmap`` argument can be passed to
-an ``async_mmap`` parameter.
+an ``async_mmap`` parameter. Note that the only the non-blocking API ``try_ready``
+and ``try_write`` should be used to avoid deadlocks. Detailed usage can be found at
+:ref:`Efficient Memory Accesses <tutorial/async_mmap:Efficient Memory Accesses>`
 
 .. warning::
 
@@ -579,8 +582,9 @@ an ``async_mmap`` parameter.
   // Note the &
   void task1(tapa::async_mmap<data_t>& mem) {
     // ...
-    mem.read_addr.write(...);
-    mem.read_data.read();
+    mem.read_addr.try_write(...);
+    // ...
+    mem.read_data.try_read(...);
     // ...
   }
 

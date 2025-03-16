@@ -176,6 +176,20 @@ class mmap {
   uint64_t size_;
 };
 
+template <typename T>
+class immap : public mmap<T> {
+ public:
+  // Inherit all constructors from mmap
+  using mmap<T>::mmap;
+};
+
+template <typename T>
+class ommap : public mmap<T> {
+ public:
+  // Inherit all constructors from mmap
+  using mmap<T>::mmap;
+};
+
 /// Defines a view of a piece of consecutive memory with asynchronous random
 /// accesses.
 template <typename T>
@@ -475,6 +489,57 @@ TAPA_DEFINE_MMAP(read_only);
 TAPA_DEFINE_MMAP(write_only);
 TAPA_DEFINE_MMAP(read_write);
 #undef TAPA_DEFINE_MMAP
+
+// Host-only immap types that must have correct size.
+#define TAPA_DEFINE_IMMAP(tag)                            \
+  template <typename T>                                   \
+  class tag##_immap : public immap<T> {                   \
+    tag##_immap(T* ptr) : immap<T>(ptr) {}                \
+                                                          \
+   public:                                                \
+    using immap<T>::immap;                                \
+    tag##_immap(const immap<T>& base) : immap<T>(base) {} \
+                                                          \
+    template <uint64_t N>                                 \
+    tag##_immap<vec_t<T, N>> vectorized() const {         \
+      return immap<T>::template vectorized<N>();          \
+    }                                                     \
+    template <typename U>                                 \
+    tag##_immap<U> reinterpret() const {                  \
+      return immap<T>::template reinterpret<U>();         \
+    }                                                     \
+  }
+TAPA_DEFINE_IMMAP(placeholder);
+TAPA_DEFINE_IMMAP(read_only);
+TAPA_DEFINE_IMMAP(write_only);
+TAPA_DEFINE_IMMAP(read_write);
+#undef TAPA_DEFINE_IMMAP
+
+// Host-only ommap types that must have correct size.
+#define TAPA_DEFINE_OMMAP(tag)                            \
+  template <typename T>                                   \
+  class tag##_ommap : public ommap<T> {                   \
+    tag##_ommap(T* ptr) : ommap<T>(ptr) {}                \
+                                                          \
+   public:                                                \
+    using ommap<T>::ommap;                                \
+    tag##_ommap(const ommap<T>& base) : ommap<T>(base) {} \
+                                                          \
+    template <uint64_t N>                                 \
+    tag##_ommap<vec_t<T, N>> vectorized() const {         \
+      return ommap<T>::template vectorized<N>();          \
+    }                                                     \
+    template <typename U>                                 \
+    tag##_ommap<U> reinterpret() const {                  \
+      return ommap<T>::template reinterpret<U>();         \
+    }                                                     \
+  }
+TAPA_DEFINE_OMMAP(placeholder);
+TAPA_DEFINE_OMMAP(read_only);
+TAPA_DEFINE_OMMAP(write_only);
+TAPA_DEFINE_OMMAP(read_write);
+#undef TAPA_DEFINE_OMMAP
+
 #define TAPA_DEFINE_MMAPS(tag)                                        \
   template <typename T, uint64_t S>                                   \
   class tag##_mmaps : public mmaps<T, S> {                            \
@@ -505,7 +570,7 @@ template <typename T>
 struct accessor<async_mmap<T>, mmap<T>&> {
   [[deprecated("please use async_mmap<T>& in formal parameters")]]  //
   static async_mmap<T>
-  access(mmap<T>& arg) {
+  access(mmap<T>& arg, bool) {
     LOG_FIRST_N(ERROR, 1) << "please use async_mmap<T>& in formal parameters";
     return async_mmap<T>::schedule(arg);
   }
@@ -513,21 +578,21 @@ struct accessor<async_mmap<T>, mmap<T>&> {
 
 template <typename T>
 struct accessor<async_mmap<T>&, mmap<T>&> {
-  static async_mmap<T> access(mmap<T>& arg) {
+  static async_mmap<T> access(mmap<T>& arg, bool) {
     return async_mmap<T>::schedule(arg);
   }
 };
 
 template <typename T, uint64_t S>
 struct accessor<mmap<T>, mmaps<T, S>&> {
-  static mmap<T> access(mmaps<T, S>& arg) { return arg.access(); }
+  static mmap<T> access(mmaps<T, S>& arg, bool) { return arg.access(); }
 };
 
 template <typename T, uint64_t S>
 struct accessor<async_mmap<T>, mmaps<T, S>&> {
   [[deprecated("please use async_mmap<T>& in formal parameters")]]  //
   static async_mmap<T>
-  access(mmaps<T, S>& arg) {
+  access(mmaps<T, S>& arg, bool) {
     LOG_FIRST_N(ERROR, 1) << "please use async_mmap<T>& in formal parameters";
     return async_mmap<T>::schedule(arg.access());
   }
@@ -535,7 +600,7 @@ struct accessor<async_mmap<T>, mmaps<T, S>&> {
 
 template <typename T, uint64_t S>
 struct accessor<async_mmap<T>&, mmaps<T, S>&> {
-  static async_mmap<T> access(mmaps<T, S>& arg) {
+  static async_mmap<T> access(mmaps<T, S>& arg, bool) {
     return async_mmap<T>::schedule(arg.access());
   }
 };
@@ -543,7 +608,7 @@ struct accessor<async_mmap<T>&, mmaps<T, S>&> {
 #define TAPA_DEFINE_ACCESSER(tag, frt_tag)                         \
   template <typename T>                                            \
   struct accessor<mmap<T>, tag##_mmap<T>> {                        \
-    static mmap<T> access(tag##_mmap<T> arg) { return arg; }       \
+    static mmap<T> access(tag##_mmap<T> arg, bool) { return arg; } \
     static void access(fpga::Instance& instance, int& idx,         \
                        tag##_mmap<T> arg) {                        \
       auto buf = fpga::frt_tag(arg.get(), arg.size());             \
@@ -576,6 +641,16 @@ TAPA_DEFINE_ACCESSER(read_only, WriteOnly);
 TAPA_DEFINE_ACCESSER(write_only, ReadOnly);
 TAPA_DEFINE_ACCESSER(read_write, ReadWrite);
 #undef TAPA_DEFINE_ACCESSER
+
+// If the user uses mmap/mmaps directly in tapa::invoke, it should be an error.
+//
+// This errors when mmap/mmaps are directly passed by value in the argument
+// list, which is the case in tapa::invoke(), where mmap<T> parameter has
+// an argument of mmap<T> instead of mmap<T> &.
+//
+// This does not apply to tapa::task().invoke() because the later always passes
+// by reference, so that stream can be passed into istream &, using accessors.
+// Therefore, mmaps arguments also have types of mmap &, instead of mmap.
 template <typename T>
 struct accessor<mmap<T>, mmap<T>> {
   static_assert(!std::is_same<T, T>::value,
@@ -594,5 +669,20 @@ struct accessor<mmaps<T, S>, mmaps<T, S>> {
 }  // namespace internal
 
 }  // namespace tapa
+
+// Generalized window_readincr for AIE
+template <typename T>
+T window_readincr(tapa::immap<const T>& mem) {
+  T res = *mem;
+  mem++;
+  return res;
+}
+
+// Generalized window_writeincr for AIE
+template <typename T>
+void window_writeincr(tapa::ommap<T>& mem, const T& val) {
+  *mem = val;
+  mem++;
+}
 
 #endif  // TAPA_HOST_MMAP_H_

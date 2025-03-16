@@ -35,7 +35,7 @@ warn_unreachable = true
 
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py313"
 
 
 [tool.ruff.lint]
@@ -114,3 +114,15 @@ ignore = [
 
 [tool.ruff.format]
 docstring-code-format = true
+
+
+[tool.pyright]
+exclude = [
+  # Please keep sorted
+  "**/.*",
+  "**/__pycache__",
+  "**/node_modules",
+  "bazel-*",
+  "build",
+  "external",
+]

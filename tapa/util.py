@@ -16,7 +16,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import coloredlogs
 
@@ -26,25 +26,42 @@ if TYPE_CHECKING:
 _logger = logging.getLogger().getChild(__name__)
 
 
+class Options:
+    """Global configuration options."""
+
+    enable_pyslang: bool = False
+
+    # Only clang-format the first 1MB code to avoid performance bottleneck:
+    # https://github.com/rapidstream-org/rapidstream-tapa/issues/232
+    clang_format_quota_in_bytes: int = 1_000_000
+
+
+_clang_formatted_byte_count = 0
+
+
 def clang_format(code: str, *args: str) -> str:
     """Apply clang-format with given arguments, if possible."""
-    for version in range(10, 4, -1):
-        clang_format_exe = shutil.which("clang-format-%d" % version)
+    for version in range(20, 4, -1):
+        clang_format_exe = shutil.which(f"clang-format-{version}")
         if clang_format_exe is not None:
             break
     else:
         clang_format_exe = shutil.which("clang-format")
-    if clang_format_exe is not None:
-        proc = subprocess.run(
-            [clang_format_exe, *args],
-            input=code,
-            stdout=subprocess.PIPE,
-            check=True,
-            text=True,
-        )
-        proc.check_returncode()
-        return proc.stdout
-    return code
+    if clang_format_exe is None:
+        return code
+
+    global _clang_formatted_byte_count  # noqa: PLW0603
+    new_byte_count = _clang_formatted_byte_count + len(code)
+    if new_byte_count > Options.clang_format_quota_in_bytes:
+        return code
+    _clang_formatted_byte_count = new_byte_count
+
+    _logger.debug("clang-format quota: %d bytes", new_byte_count)
+    return subprocess.check_output(
+        [clang_format_exe, *args],
+        input=code,
+        text=True,
+    )
 
 
 def get_indexed_name(name: str, idx: int | None) -> str:
@@ -77,36 +94,71 @@ def get_module_name(module: str) -> str:
     return f"{module}"
 
 
-def get_xilinx_hls_path() -> str | None:
-    "Returns the XILINX_HLS path."
-    xilinx_hls = os.environ.get("XILINX_HLS")
-    if xilinx_hls is None:
-        _logger.critical("not adding vendor include paths; please set XILINX_HLS")
+def get_xilinx_tool_path(tool_name: Literal["HLS", "VITIS"] = "HLS") -> str | None:
+    "Returns the XILINX_<TOOL> path."
+    xilinx_tool_path = os.environ.get(f"XILINX_{tool_name}")
+    if xilinx_tool_path is None:
+        _logger.critical("not adding vendor include paths;")
+        _logger.critical("please set XILINX_%s", tool_name)
         _logger.critical("you may run `source /path/to/Vitis/settings64.sh`")
-    return xilinx_hls
+    elif not Path(xilinx_tool_path).exists():
+        _logger.critical(
+            "XILINX_%s path does not exist: %s", tool_name, xilinx_tool_path
+        )
+        xilinx_tool_path = None
+    return xilinx_tool_path
+
+
+def get_xpfm_path(platform: str) -> str | None:
+    "Returns the XPFM path for a platform."
+    xilinx_vitis_path = get_xilinx_tool_path("VITIS")
+    path_in_vitis = f"{xilinx_vitis_path}/base_platforms/{platform}/{platform}.xpfm"
+    path_in_opt = f"/opt/xilinx/platforms/{platform}/{platform}.xpfm"
+    if os.path.exists(path_in_vitis):
+        return path_in_vitis
+    if os.path.exists(path_in_opt):
+        return path_in_opt
+
+    _logger.critical("Cannot find XPFM for platform %s", platform)
+    return None
 
 
 def get_vendor_include_paths() -> Iterable[str]:
     """Yields include paths that are automatically available in vendor tools."""
-    xilinx_hls = get_xilinx_hls_path()
+    xilinx_hls = get_xilinx_tool_path("HLS")
     if xilinx_hls is not None:
-        cpp_include = "tps/lnx64/gcc-6.2.0/include/c++/6.2.0"
+        # include VITIS_HLS/include
         yield os.path.join(xilinx_hls, "include")
-        yield os.path.join(xilinx_hls, cpp_include)
-        yield os.path.join(xilinx_hls, cpp_include, "x86_64-pc-linux-gnu")
 
+        # there are multiple versions of gcc, such as 6.2.0, 9.3.0, 11.4.0,
+        # we choose the latest version based on numerical order
+        tps_lnx64 = Path(xilinx_hls) / "tps" / "lnx64"
+        gcc_paths = tps_lnx64.glob("gcc-*.*.*")
+        gcc_versions = [path.name.split("-")[1] for path in gcc_paths]
+        if not gcc_versions:
+            _logger.critical("cannot find HLS vendor GCC")
+            _logger.critical("it should be at %s", tps_lnx64)
+            return
+        gcc_versions.sort(key=lambda x: tuple(map(int, x.split("."))))
+        latest_gcc = gcc_versions[-1]
 
-def get_installation_path() -> Path:
-    """Returns the directory where TAPA pre-built binary is installed."""
-    home = os.environ.get("RAPIDSTREAM_TAPA_HOME")
-    if home is not None:
-        return Path(home)
-    # `__file__` is like `/path/to/usr/share/tapa/runtime/tapa/util.py`
-    return Path(__file__).parent.parent.parent.parent.parent.parent
+        # include VITIS_HLS/tps/lnx64/g++-<version>/include/c++/<version>
+        cpp_include = tps_lnx64 / f"gcc-{latest_gcc}" / "include" / "c++" / latest_gcc
+        if not cpp_include.exists():
+            _logger.critical("cannot find HLS vendor paths for C++")
+            _logger.critical("it should be at %s", cpp_include)
+            return
+        yield str(cpp_include)
 
-
-def nproc() -> int:
-    return int(subprocess.check_output(["nproc"]))
+        # there might be a x86_64-pc-linux-gnu or x86_64-linux-gnu
+        if (cpp_include / "x86_64-pc-linux-gnu").exists():
+            yield os.path.join(cpp_include, "x86_64-pc-linux-gnu")
+        elif (cpp_include / "x86_64-linux-gnu").exists():
+            yield os.path.join(cpp_include, "x86_64-linux-gnu")
+        else:
+            _logger.critical("cannot find HLS vendor paths for C++ (x86_64)")
+            _logger.critical("it should be at %s", cpp_include)
+            return
 
 
 def setup_logging(

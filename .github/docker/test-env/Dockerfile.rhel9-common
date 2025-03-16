@@ -12,6 +12,7 @@ ARG DOCKER_GROUP_ID
 #   - util-linux
 
 # Required by Vivado:
+#   - hostname
 #   - libX11
 
 # Required by us:
@@ -21,6 +22,8 @@ ARG DOCKER_GROUP_ID
 #   - tar (for installation)
 
 RUN yum update -y && \
+    # Update the following line to the latest date for retriggering the docker build
+    echo "Installing system dependencies as of 20250306" && \
     yum install -y \
         autoconf \
         bison \
@@ -30,6 +33,7 @@ RUN yum update -y && \
         git \
         glibc-langpack-en \
         gperf \
+        hostname \
         libX11 \
         libxcrypt-compat \
         ocl-icd \

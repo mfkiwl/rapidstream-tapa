@@ -11,8 +11,8 @@
 #include <fstream>
 #include <ios>
 #include <iostream>
+#include <memory>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -26,17 +26,12 @@
 #include <nlohmann/json.hpp>
 
 #include "frt/arg_info.h"
+#include "frt/devices/filesystem.h"
+#include "frt/devices/shared_memory_stream.h"
 #include "frt/devices/xilinx_environ.h"
+#include "frt/stream_arg.h"
 #include "frt/subprocess.h"
 #include "frt/zip_file.h"
-
-#ifdef __cpp_lib_filesystem
-#include <filesystem>
-namespace fs = std::filesystem;
-#else
-#include <experimental/filesystem>
-namespace fs = std::experimental::filesystem;
-#endif
 
 DEFINE_bool(xosim_start_gui, false, "start Vivado GUI for simulation");
 DEFINE_bool(xosim_save_waveform, false, "save waveform in the work directory");
@@ -46,6 +41,11 @@ DEFINE_string(xosim_work_dir, "",
 DEFINE_string(xosim_executable, "",
               "if not empty, use the specified executable instead of "
               "`tapa-fast-cosim`");
+DEFINE_string(xosim_part_num, "",
+              "if not empty, use the specified part number for Vivado");
+DEFINE_bool(xosim_setup_only, false, "only setup the simulation");
+DEFINE_bool(xosim_resume_from_post_sim, false,
+            "skip simulation and do post-sim checking");
 
 namespace fpga {
 namespace internal {
@@ -80,6 +80,11 @@ std::string GetConfigPath(const std::string& work_dir) {
 }
 
 }  // namespace
+
+struct TapaFastCosimDevice::Context {
+  std::chrono::time_point<std::chrono::steady_clock> start_timestamp;
+  subprocess::Popen proc;
+};
 
 TapaFastCosimDevice::TapaFastCosimDevice(std::string_view xo_path)
     : xo_path(fs::absolute(xo_path)), work_dir(GetWorkDirectory()) {
@@ -180,8 +185,8 @@ void TapaFastCosimDevice::SetBufferArg(int index, Tag tag,
   }
 }
 
-void TapaFastCosimDevice::SetStreamArg(int index, Tag tag, StreamWrapper& arg) {
-  LOG(FATAL) << "TAPA fast cosim device does not support streaming";
+void TapaFastCosimDevice::SetStreamArg(int index, Tag tag, StreamArg& arg) {
+  stream_table_[index] = arg.get<std::shared_ptr<SharedMemoryStream>>();
 }
 
 size_t TapaFastCosimDevice::SuspendBuffer(int index) {
@@ -189,6 +194,10 @@ size_t TapaFastCosimDevice::SuspendBuffer(int index) {
 }
 
 void TapaFastCosimDevice::WriteToDevice() {
+  is_write_to_device_scheduled_ = true;
+}
+
+void TapaFastCosimDevice::WriteToDeviceImpl() {
   // All buffers must have a data file.
   auto tic = clock::now();
   for (const auto& [index, buffer_arg] : buffer_table_) {
@@ -200,6 +209,10 @@ void TapaFastCosimDevice::WriteToDevice() {
 }
 
 void TapaFastCosimDevice::ReadFromDevice() {
+  is_read_from_device_scheduled_ = true;
+}
+
+void TapaFastCosimDevice::ReadFromDeviceImpl() {
   auto tic = clock::now();
   for (int index : store_indices_) {
     auto buffer_arg = buffer_table_.at(index);
@@ -211,20 +224,37 @@ void TapaFastCosimDevice::ReadFromDevice() {
 }
 
 void TapaFastCosimDevice::Exec() {
+  if (is_write_to_device_scheduled_) {
+    WriteToDeviceImpl();
+  }
+
   auto tic = clock::now();
 
   nlohmann::json json;
   json["xo_path"] = xo_path;
-  auto& scalar_to_val = json["scalar_to_val"];
+
+  nlohmann::json scalar_to_val = nlohmann::json::object();
   for (const auto& [index, scalar] : scalars_) {
     scalar_to_val[std::to_string(index)] = scalar;
   }
-  auto& axi_to_c_array_size = json["axi_to_c_array_size"];
-  auto& axi_to_data_file = json["axi_to_data_file"];
+  json["scalar_to_val"] = std::move(scalar_to_val);
+
+  nlohmann::json axi_to_c_array_size = nlohmann::json::object();
+  nlohmann::json axi_to_data_file = nlohmann::json::object();
   for (const auto& [index, content] : buffer_table_) {
     axi_to_c_array_size[std::to_string(index)] = content.SizeInCount();
     axi_to_data_file[std::to_string(index)] = GetInputDataPath(work_dir, index);
   }
+  json["axi_to_c_array_size"] = std::move(axi_to_c_array_size);
+  json["axi_to_data_file"] = std::move(axi_to_data_file);
+
+  nlohmann::json axis_to_data_file = nlohmann::json::object();
+  for (const auto& [index, stream] : stream_table_) {
+    VLOG(1) << "arg[" << index << "] is a stream backed by " << stream->path();
+    axis_to_data_file[std::to_string(index)] = stream->path();
+  }
+  json["axis_to_data_file"] = std::move(axis_to_data_file);
+
   std::ofstream(GetConfigPath(work_dir)) << json.dump(2);
 
   std::vector<std::string> argv;
@@ -244,16 +274,45 @@ void TapaFastCosimDevice::Exec() {
   if (FLAGS_xosim_save_waveform) {
     argv.push_back("--save_waveform");
   }
-  int rc =
-      subprocess::Popen(argv, subprocess::environment(xilinx::GetEnviron()))
-          .wait();
-  LOG_IF(FATAL, rc != 0) << "TAPA fast cosim failed";
+  if (FLAGS_xosim_setup_only) {
+    argv.push_back("--setup_only");
+  }
+  if (!FLAGS_xosim_part_num.empty()) {
+    argv.push_back("--part_num=" + FLAGS_xosim_part_num);
+  }
 
-  compute_time_ = clock::now() - tic;
+  // launch simulation as a noop if resume from post sim
+  if (FLAGS_xosim_resume_from_post_sim) {
+    argv = {"/bin/sh", "-c", ":"};
+  }
+
+  context_ = std::make_unique<Context>(Context{
+      .start_timestamp = tic,
+      .proc = subprocess::Popen(argv,
+                                subprocess::environment(xilinx::GetEnviron())),
+  });
 }
 
 void TapaFastCosimDevice::Finish() {
-  // Not implemented.
+  LOG_IF(FATAL, context_ == nullptr) << "Exec() must be called before Finish()";
+  int rc = context_->proc.wait();
+
+  LOG_IF(FATAL, rc != 0) << "TAPA fast cosim failed";
+
+  // skip the rest of the function if only setup is needed
+  if (FLAGS_xosim_setup_only) {
+    exit(0);
+  }
+
+  compute_time_ = clock::now() - context_->start_timestamp;
+
+  if (is_read_from_device_scheduled_) {
+    ReadFromDeviceImpl();
+  }
+}
+
+bool TapaFastCosimDevice::IsFinished() const {
+  return context_ != nullptr && context_->proc.poll() >= 0;
 }
 
 std::vector<ArgInfo> TapaFastCosimDevice::GetArgsInfo() const { return args_; }

@@ -20,7 +20,7 @@ import zipfile
 from collections.abc import Iterable
 from types import TracebackType
 from typing import BinaryIO, NamedTuple, TextIO
-from xml.etree import ElementTree
+from xml.etree import ElementTree as ET
 
 _logger = logging.getLogger().getChild(__name__)
 
@@ -142,7 +142,9 @@ set tmp_ip_dir "{tmpdir}/tmp_ip_dir"
 set tmp_project "{tmpdir}/tmp_project"
 
 create_project -force kernel_pack ${{tmp_project}}{part_num}
-add_files -norecurse [glob {hdl_dir}/*.v {hdl_dir}/*/*.v {hdl_dir}/*.dat]
+add_files {{
+  {src_files}
+}}
 foreach tcl_file [glob -nocomplain {hdl_dir}/*.tcl {hdl_dir}/*/*.tcl] {{
   source ${{tcl_file}}
 }}
@@ -229,9 +231,14 @@ class PackageXo(Vivado):
             for key, value in m_axi_names.get(m_axi_name, {}).items():
                 bus_ifaces.append(BUS_PARAM.format(m_axi_iface_name, key, value))
 
+        # get all files under hdl_dir that does not ends with .tcl
+        all_files = glob.glob(f"{hdl_dir}/**", recursive=True)
+        src_files = [f for f in all_files if not f.endswith(".tcl")]
+
         kwargs = {
             "top_name": top_name,
             "kernel_xml": kernel_xml,
+            "src_files": " ".join(src_files),
             "hdl_dir": hdl_dir,
             "xo_file": xo_file,
             "bus_ifaces": "".join(bus_ifaces),
@@ -263,6 +270,9 @@ config_compile -name_max_length 253
 config_interface -m_axi_addr64
 {config}
 {other_configs}
+set_param hls.enable_hidden_option_error false
+config_rtl -enableFreeRunPipeline=false
+config_rtl -disableAutoFreeRunPipeline=true
 csynth_design
 exit
 """
@@ -277,6 +287,8 @@ class RunHls(VivadoHls):
     Args:
       tarfileobj: File object that will contain the reports and HDL files.
       kernel_files: File names or tuple of file names and cflags of the kernels.
+      work_dir: The working directory for the HLS run or None for a temporary
+          directory.
       top_name: Top-level module name.
       clock_period: Target clock period.
       part_num: Target part number.
@@ -290,6 +302,7 @@ class RunHls(VivadoHls):
         self,
         tarfileobj: BinaryIO,
         kernel_files: Iterable[str | tuple[str, str]],
+        work_dir: str | None,
         top_name: str,
         clock_period: str,
         part_num: str,
@@ -299,7 +312,13 @@ class RunHls(VivadoHls):
         std: str = "c++11",
         other_configs: str = "",
     ) -> None:
-        self.project_dir = tempfile.TemporaryDirectory(prefix=f"run-hls-{top_name}-")
+        if work_dir is None:
+            self.tempdir = tempfile.TemporaryDirectory(prefix=f"run-hls-{top_name}-")
+            self.project_path = self.tempdir.name
+        else:
+            self.tempdir = None
+            self.project_path = f"{work_dir}/{top_name}"
+            os.makedirs(self.project_path, exist_ok=True)
         self.project_name = "project"
         self.solution_name = top_name
         self.tarfileobj = tarfileobj
@@ -321,7 +340,7 @@ class RunHls(VivadoHls):
             elif hls == "vitis_hls":
                 rtl_config += " -module_auto_prefix"
         kwargs = {
-            "project_dir": self.project_dir.name,
+            "project_dir": self.project_path,
             "project_name": self.project_name,
             "solution_name": self.solution_name,
             "top_name": top_name,
@@ -331,7 +350,7 @@ class RunHls(VivadoHls):
             "config": rtl_config,
             "other_configs": other_configs,
         }
-        super().__init__(HLS_COMMANDS.format(**kwargs), hls, self.project_dir.name)
+        super().__init__(HLS_COMMANDS.format(**kwargs), hls, self.project_path)
 
     def __exit__(
         self,
@@ -344,14 +363,14 @@ class RunHls(VivadoHls):
         if self.returncode == 0:
             with tarfile.open(mode="w", fileobj=self.tarfileobj) as tar:
                 solution_dir = os.path.join(
-                    self.project_dir.name, self.project_name, self.solution_name
+                    self.project_path, self.project_name, self.solution_name
                 )
                 try:
                     tar.add(os.path.join(solution_dir, "syn/report"), arcname="report")
                     tar.add(os.path.join(solution_dir, "syn/verilog"), arcname="hdl")
                     tar.add(
                         os.path.join(
-                            solution_dir, self.project_dir.name, f"{self.hls}.log"
+                            solution_dir, self.project_path, f"{self.hls}.log"
                         ),
                         arcname="log/" + self.solution_name + ".log",
                     )
@@ -368,7 +387,95 @@ class RunHls(VivadoHls):
                     self.returncode = 1
                     _logger.error("%s", e)
         super().__exit__(exc_type, exc_value, traceback)
-        self.project_dir.cleanup()
+        if self.tempdir is not None:
+            self.tempdir.cleanup()
+
+
+class RunAie(subprocess.Popen):
+    """Runs Vitis AIE for the given kernels and generate aie.a files
+
+    This is a subclass of subprocess.Popen. A temporary directory will be created
+    and used as the working directory.
+    """
+
+    def __init__(  # noqa: PLR0913,PLR0917
+        self,
+        tarfileobj: BinaryIO,
+        kernel_files: Iterable[str],
+        work_dir: str | None,
+        top_name: str,
+        clock_period: str,  # noqa: ARG002
+        xpfm: str | None,
+    ) -> None:
+        if work_dir is None:
+            self.tempdir = tempfile.TemporaryDirectory(prefix=f"run-aie-{top_name}-")
+            self.project_path = self.tempdir.name
+        else:
+            self.tempdir = None
+            self.project_path = f"{work_dir}/{top_name}"
+            os.makedirs(self.project_path, exist_ok=True)
+        self.project_name = "project"
+        self.solution_name = top_name
+        self.tarfileobj = tarfileobj
+        self.aiecompiler = "aiecompiler"
+        include_path_str = [f"--include={os.path.dirname(f)}" for f in kernel_files]
+        cmd_args = [
+            self.aiecompiler,
+            "--target=hw",
+            f"--platform={xpfm}",
+            *include_path_str,
+            f"--workdir={self.project_path}",
+            *kernel_files,
+        ]
+        kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": os.environ
+            | {
+                "HOME": self.project_path,
+            },
+        }
+
+        cmd_args = get_cmd_args(cmd_args, ["XILINX_VITIS"], kwargs)
+        super().__init__(cmd_args, cwd=self.project_path, **kwargs)
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        # wait for process termination and keep the log
+        subprocess.Popen.__exit__(self, exc_type, exc_value, traceback)
+        if self.returncode == 0:
+            with tarfile.open(mode="w", fileobj=self.tarfileobj) as tar:
+                solution_dir = os.path.join(
+                    self.project_path, self.project_name, self.solution_name
+                )
+                try:
+                    tar.add(os.path.join(solution_dir, "syn/report"), arcname="report")
+                    tar.add(os.path.join(solution_dir, "syn/verilog"), arcname="hdl")
+                    tar.add(
+                        os.path.join(
+                            solution_dir, self.project_path, f"{self.hls}.log"
+                        ),
+                        arcname="log/" + self.solution_name + ".log",
+                    )
+                    for pattern in (
+                        "*.sched.adb.xml",
+                        "*.verbose.sched.rpt",
+                        "*.verbose.sched.rpt.xml",
+                    ):
+                        for f in glob.glob(
+                            os.path.join(solution_dir, ".autopilot", "db", pattern)
+                        ):
+                            tar.add(f, arcname="report/" + os.path.basename(f))
+                except FileNotFoundError as e:
+                    self.returncode = 1
+                    _logger.error("%s", e)
+        super().__exit__(exc_type, exc_value, traceback)
+        if self.tempdir is not None:
+            self.tempdir.cleanup()
 
 
 XILINX_XML_NS = {"xd": "http://www.xilinx.com/xd"}
@@ -398,7 +505,7 @@ def get_device_info(platform_path: str) -> dict[str, str]:
         zipfile.ZipFile(platform_file) as platform,
         platform.open(os.path.basename(platform_file)[:-4] + ".hpfm") as metadata,
     ):
-        platform_info = ElementTree.parse(metadata).find(
+        platform_info = ET.parse(metadata).find(
             "./xd:component/xd:platformInfo", XILINX_XML_NS
         )
         if platform_info is None:
@@ -644,337 +751,3 @@ def get_cmd_args(
                     ]
                 )
     return cmd_args
-
-
-BRAM_FIFO_TEMPLATE = """`default_nettype none
-
-// first-word fall-through (FWFT) FIFO using block RAM
-// based on HLS generated code
-module {name} #(
-  parameter MEM_STYLE  = "auto",
-  parameter DATA_WIDTH = {width},
-  parameter ADDR_WIDTH = {addr_width},
-  parameter DEPTH      = {depth}
-) (
-  input wire clk,
-  input wire reset,
-
-  // write
-  output wire                  if_full_n,
-  input  wire                  if_write_ce,
-  input  wire                  if_write,
-  input  wire [DATA_WIDTH-1:0] if_din,
-
-  // read
-  output wire                  if_empty_n,
-  input  wire                  if_read_ce,
-  input  wire                  if_read,
-  output wire [DATA_WIDTH-1:0] if_dout
-);
-
-(* ram_style = MEM_STYLE *)
-reg  [DATA_WIDTH-1:0] mem[0:DEPTH-1];
-reg  [DATA_WIDTH-1:0] q_buf;
-reg  [ADDR_WIDTH-1:0] waddr;
-reg  [ADDR_WIDTH-1:0] raddr;
-wire [ADDR_WIDTH-1:0] wnext;
-wire [ADDR_WIDTH-1:0] rnext;
-wire                  push;
-wire                  pop;
-reg  [ADDR_WIDTH-1:0] used;
-reg                   full_n;
-reg                   empty_n;
-reg  [DATA_WIDTH-1:0] q_tmp;
-reg                   show_ahead;
-reg  [DATA_WIDTH-1:0] dout_buf;
-reg                   dout_valid;
-
-localparam DepthM1 = DEPTH[ADDR_WIDTH-1:0] - 1'd1;
-
-assign if_full_n  = full_n;
-assign if_empty_n = dout_valid;
-assign if_dout    = dout_buf;
-assign push       = full_n & if_write_ce & if_write;
-assign pop        = empty_n & if_read_ce & (~dout_valid | if_read);
-assign wnext      = !push              ? waddr              :
-                    (waddr == DepthM1) ? {{ADDR_WIDTH{{1'b0}}}} : waddr + 1'd1;
-assign rnext      = !pop               ? raddr              :
-                    (raddr == DepthM1) ? {{ADDR_WIDTH{{1'b0}}}} : raddr + 1'd1;
-
-// waddr
-always @(posedge clk) begin
-  if (reset)
-    waddr <= {{ADDR_WIDTH{{1'b0}}}};
-  else
-    waddr <= wnext;
-end
-
-// raddr
-always @(posedge clk) begin
-  if (reset)
-    raddr <= {{ADDR_WIDTH{{1'b0}}}};
-  else
-    raddr <= rnext;
-end
-
-// used
-always @(posedge clk) begin
-  if (reset)
-    used <= {{ADDR_WIDTH{{1'b0}}}};
-  else if (push && !pop)
-    used <= used + 1'b1;
-  else if (!push && pop)
-    used <= used - 1'b1;
-end
-
-// full_n
-always @(posedge clk) begin
-  if (reset)
-    full_n <= 1'b1;
-  else if (push && !pop)
-    full_n <= (used != DepthM1);
-  else if (!push && pop)
-    full_n <= 1'b1;
-end
-
-// empty_n
-always @(posedge clk) begin
-  if (reset)
-    empty_n <= 1'b0;
-  else if (push && !pop)
-    empty_n <= 1'b1;
-  else if (!push && pop)
-    empty_n <= (used != {{{{(ADDR_WIDTH-1){{1'b0}}}},1'b1}});
-end
-
-// mem
-always @(posedge clk) begin
-  if (push)
-    mem[waddr] <= if_din;
-end
-
-// q_buf
-always @(posedge clk) begin
-  q_buf <= mem[rnext];
-end
-
-// q_tmp
-always @(posedge clk) begin
-  if (reset)
-    q_tmp <= {{DATA_WIDTH{{1'b0}}}};
-  else if (push)
-    q_tmp <= if_din;
-end
-
-// show_ahead
-always @(posedge clk) begin
-  if (reset)
-    show_ahead <= 1'b0;
-  else if (push && used == {{{{(ADDR_WIDTH-1){{1'b0}}}},pop}})
-    show_ahead <= 1'b1;
-  else
-    show_ahead <= 1'b0;
-end
-
-// dout_buf
-always @(posedge clk) begin
-  if (reset)
-    dout_buf <= {{DATA_WIDTH{{1'b0}}}};
-  else if (pop)
-    dout_buf <= show_ahead? q_tmp : q_buf;
-end
-
-// dout_valid
-always @(posedge clk) begin
-  if (reset)
-    dout_valid <= 1'b0;
-  else if (pop)
-    dout_valid <= 1'b1;
-  else if (if_read_ce & if_read)
-    dout_valid <= 1'b0;
-end
-
-endmodule  // fifo_bram
-
-`default_nettype wire
-"""
-
-SRL_FIFO_TEMPLATE = """`default_nettype none
-
-// first-word fall-through (FWFT) FIFO using shift register LUT
-// based on HLS generated code
-module {name} #(
-  parameter MEM_STYLE  = "shiftreg",
-  parameter DATA_WIDTH = {width},
-  parameter ADDR_WIDTH = {addr_width},
-  parameter DEPTH      = {depth}
-) (
-  input wire clk,
-  input wire reset,
-
-  // write
-  output wire                  if_full_n,
-  input  wire                  if_write_ce,
-  input  wire                  if_write,
-  input  wire [DATA_WIDTH-1:0] if_din,
-
-  // read
-  output wire                  if_empty_n,
-  input  wire                  if_read_ce,
-  input  wire                  if_read,
-  output wire [DATA_WIDTH-1:0] if_dout
-);
-
-  wire [ADDR_WIDTH - 1:0] shift_reg_addr;
-  wire [DATA_WIDTH - 1:0] shift_reg_data;
-  wire [DATA_WIDTH - 1:0] shift_reg_q;
-  wire                    shift_reg_ce;
-  reg  [ADDR_WIDTH:0]     out_ptr;
-  reg                     internal_empty_n;
-  reg                     internal_full_n;
-
-  (* shreg_extract = "yes" *) reg [DATA_WIDTH-1:0] mem [0:DEPTH-1];
-
-  assign if_empty_n = internal_empty_n;
-  assign if_full_n = internal_full_n;
-  assign shift_reg_data = if_din;
-  assign if_dout = shift_reg_q;
-
-  assign shift_reg_addr = out_ptr[ADDR_WIDTH] == 1'b0 ?
-        out_ptr[ADDR_WIDTH-1:0] : {{ADDR_WIDTH{{1'b0}}}};
-  assign shift_reg_ce = (if_write & if_write_ce) & internal_full_n;
-
-  assign shift_reg_q = mem[shift_reg_addr];
-
-  always @(posedge clk) begin
-    if (reset) begin
-      out_ptr <= ~{{ADDR_WIDTH+1{{1'b0}}}};
-      internal_empty_n <= 1'b0;
-      internal_full_n <= 1'b1;
-    end else begin
-      if (((if_read && if_read_ce) && internal_empty_n) &&
-          (!(if_write && if_write_ce) || !internal_full_n)) begin
-        out_ptr <= out_ptr - 1'b1;
-        if (out_ptr == {{(ADDR_WIDTH+1){{1'b0}}}})
-          internal_empty_n <= 1'b0;
-        internal_full_n <= 1'b1;
-      end
-      else if (((if_read & if_read_ce) == 0 | internal_empty_n == 0) &&
-        ((if_write & if_write_ce) == 1 & internal_full_n == 1))
-      begin
-        out_ptr <= out_ptr + 1'b1;
-        internal_empty_n <= 1'b1;
-        if (out_ptr == DEPTH - {{{{(ADDR_WIDTH-1){{1'b0}}}}, 2'd2}})
-          internal_full_n <= 1'b0;
-      end
-    end
-  end
-
-  integer i;
-  always @(posedge clk) begin
-    if (shift_reg_ce) begin
-      for (i = 0; i < DEPTH - 1; i = i + 1)
-        mem[i + 1] <= mem[i];
-      mem[0] <= shift_reg_data;
-    end
-  end
-
-endmodule  // fifo_srl
-
-`default_nettype wire
-"""
-
-AUTO_FIFO_TEMPLATE = """`default_nettype none
-
-// first-word fall-through (FWFT) FIFO
-// if its capacity > THRESHOLD bits, it uses block RAM, otherwise it will uses
-// shift register LUT
-module {name} #(
-  parameter DATA_WIDTH = 32,
-  parameter ADDR_WIDTH = 5,
-  parameter DEPTH      = 32,
-  parameter THRESHOLD  = 18432
-) (
-  input wire clk,
-  input wire reset,
-
-  // write
-  output wire                  if_full_n,
-  input  wire                  if_write_ce,
-  input  wire                  if_write,
-  input  wire [DATA_WIDTH-1:0] if_din,
-
-  // read
-  output wire                  if_empty_n,
-  input  wire                  if_read_ce,
-  input  wire                  if_read,
-  output wire [DATA_WIDTH-1:0] if_dout
-);
-
-generate
-  if (DATA_WIDTH >= 36 && DEPTH >= 4096) begin : uram
-    fifo_bram #(
-      .MEM_STYLE ("ultra"),
-      .DATA_WIDTH(DATA_WIDTH),
-      .ADDR_WIDTH(ADDR_WIDTH),
-      .DEPTH     (DEPTH)
-    ) unit (
-      .clk  (clk),
-      .reset(reset),
-
-      .if_full_n  (if_full_n),
-      .if_write_ce(if_write_ce),
-      .if_write   (if_write),
-      .if_din     (if_din),
-
-      .if_empty_n(if_empty_n),
-      .if_read_ce(if_read_ce),
-      .if_read   (if_read),
-      .if_dout   (if_dout)
-    );
-  end else if (DATA_WIDTH * DEPTH >= THRESHOLD) begin : bram
-    fifo_bram #(
-      .MEM_STYLE ("block"),
-      .DATA_WIDTH(DATA_WIDTH),
-      .ADDR_WIDTH(ADDR_WIDTH),
-      .DEPTH     (DEPTH)
-    ) unit (
-      .clk  (clk),
-      .reset(reset),
-
-      .if_full_n  (if_full_n),
-      .if_write_ce(if_write_ce),
-      .if_write   (if_write),
-      .if_din     (if_din),
-
-      .if_empty_n(if_empty_n),
-      .if_read_ce(if_read_ce),
-      .if_read   (if_read),
-      .if_dout   (if_dout)
-    );
-  end else begin : srl
-    fifo_srl #(
-      .DATA_WIDTH(DATA_WIDTH),
-      .ADDR_WIDTH(ADDR_WIDTH),
-      .DEPTH     (DEPTH)
-    ) unit (
-      .clk  (clk),
-      .reset(reset),
-
-      .if_full_n  (if_full_n),
-      .if_write_ce(if_write_ce),
-      .if_write   (if_write),
-      .if_din     (if_din),
-
-      .if_empty_n(if_empty_n),
-      .if_read_ce(if_read_ce),
-      .if_read   (if_read),
-      .if_dout   (if_dout)
-    );
-  end
-endgenerate
-
-endmodule  // fifo
-
-`default_nettype wire
-"""

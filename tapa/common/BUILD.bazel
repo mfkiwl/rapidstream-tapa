@@ -4,8 +4,55 @@
 # All rights reserved. The contributor(s) of this file has/have agreed to the
 # RapidStream Contributor License Agreement.
 
+load("@rules_python//python:defs.bzl", "py_library")
+load("@tapa_deps//:requirements.bzl", "requirement")
+load("//bazel:pytest_rules.bzl", "py_test")
+
+package(
+    default_visibility = [
+        "//tapa:__subpackages__",
+    ],
+)
+
 py_library(
     name = "common",
-    srcs = glob(["**/*.py"]),
-    visibility = ["//tapa:__subpackages__"],
+    srcs = glob(
+        ["*.py"],
+        exclude = [
+            "pyslang_rewriter.py",
+            "unique_attrs.py",
+            "*_test.py",
+        ],
+    ),
+)
+
+py_library(
+    name = "pyslang_rewriter",
+    srcs = ["pyslang_rewriter.py"],
+    deps = [
+        requirement("pyslang"),
+        requirement("intervaltree"),
+    ],
+)
+
+py_test(
+    name = "pyslang_rewriter_test",
+    srcs = ["pyslang_rewriter_test.py"],
+    deps = [
+        ":pyslang_rewriter",
+        requirement("pyslang"),
+    ],
+)
+
+py_library(
+    name = "unique_attrs",
+    srcs = ["unique_attrs.py"],
+)
+
+py_test(
+    name = "unique_attrs_test",
+    srcs = ["unique_attrs_test.py"],
+    deps = [
+        ":unique_attrs",
+    ],
 )

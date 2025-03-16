@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <queue>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -34,11 +35,13 @@ class Visitor : public clang::RecursiveASTVisitor<Visitor> {
   explicit Visitor(
       clang::ASTContext& context,
       std::vector<const clang::FunctionDecl*>& funcs,
+      std::set<const clang::FunctionDecl*>& tapa_tasks,
       std::unordered_map<const clang::FunctionDecl*, clang::Rewriter>&
           rewriters,
       std::unordered_map<const clang::FunctionDecl*, nlohmann::json>& metadata)
       : context_{context},
         funcs_{funcs},
+        tapa_tasks_{tapa_tasks},
         rewriters_{rewriters},
         metadata_{metadata} {}
 
@@ -47,6 +50,10 @@ class Visitor : public clang::RecursiveASTVisitor<Visitor> {
 
   void VisitTask(const clang::FunctionDecl* func);
 
+  // Indicate whether the current traversal is the first one to obtain the
+  // full list of functions.
+  bool is_first_traversal = true;
+
  private:
   static thread_local const clang::FunctionDecl* rewriting_func;
   static thread_local const clang::FunctionDecl* current_task;
@@ -54,6 +61,7 @@ class Visitor : public clang::RecursiveASTVisitor<Visitor> {
 
   clang::ASTContext& context_;
   std::vector<const clang::FunctionDecl*>& funcs_;
+  std::set<const clang::FunctionDecl*>& tapa_tasks_;
   std::unordered_map<const clang::FunctionDecl*, clang::Rewriter>& rewriters_;
   std::unordered_map<const clang::FunctionDecl*, nlohmann::json>& metadata_;
 
@@ -66,8 +74,10 @@ class Visitor : public clang::RecursiveASTVisitor<Visitor> {
 
   void ProcessUpperLevelTask(const clang::ExprWithCleanups* task,
                              const clang::FunctionDecl* func);
-
+  void ProcessTaskPorts(const clang::FunctionDecl* func,
+                        nlohmann::json& metadata);
   void ProcessLowerLevelTask(const clang::FunctionDecl* func);
+  void ProcessOtherFunc(const clang::FunctionDecl* func);
 #ifdef TAPA_ENABLE_LEGACY_FRT_INTERFACE
   std::string GetFrtInterface(const clang::FunctionDecl* func);
 #endif  // TAPA_ENABLE_LEGACY_FRT_INTERFACE
@@ -86,11 +96,27 @@ class Visitor : public clang::RecursiveASTVisitor<Visitor> {
                                 llvm::ArrayRef<const clang::Attr*> attrs);
 };
 
+// Check if a task has non-synthesizable label.
+inline bool IsTaskNonSynthesizable(const clang::FunctionDecl* func) {
+  if (auto attr = func->getAttr<clang::TapaTargetAttr>()) {
+    if (attr->getTarget() ==
+        clang::TapaTargetAttr::TargetType::NON_SYNTHESIZABLE) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Find for a given upper-level task, return all direct children tasks (e.g.
 // tasks instanciated directly in upper).
 // Lower-level tasks or non-task functions return an empty vector.
 inline std::vector<const clang::FunctionDecl*> FindChildrenTasks(
     const clang::FunctionDecl* upper) {
+  // when a function is non-synthesizable, it does not have any children.
+  if (IsTaskNonSynthesizable(upper)) {
+    return {};
+  }
+
   auto body = upper->getBody();
   if (auto task = GetTapaTask(body)) {
     auto invokes = GetTapaInvokes(task);
@@ -123,7 +149,6 @@ inline std::vector<const clang::FunctionDecl*> FindAllTasks(
   std::vector<const clang::FunctionDecl*> tasks{root_upper};
   std::unordered_set<const clang::FunctionDecl*> task_set{root_upper};
   std::queue<const clang::FunctionDecl*> task_queue;
-
   task_queue.push(root_upper);
   while (!task_queue.empty()) {
     auto upper = task_queue.front();
@@ -136,7 +161,6 @@ inline std::vector<const clang::FunctionDecl*> FindAllTasks(
     }
     task_queue.pop();
   }
-
   return tasks;
 }
 

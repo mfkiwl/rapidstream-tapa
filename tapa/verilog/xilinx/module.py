@@ -4,14 +4,15 @@ All rights reserved. The contributor(s) of this file has/have agreed to the
 RapidStream Contributor License Agreement.
 """
 
-import collections
 import itertools
 import logging
 import os.path
+import re
 import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from typing import get_args
 
+import pyslang
 from pyverilog.ast_code_generator.codegen import ASTCodeGenerator
 from pyverilog.vparser.ast import (
     Always,
@@ -25,10 +26,10 @@ from pyverilog.vparser.ast import (
     Input,
     Instance,
     InstanceList,
+    Ioport,
     Lvalue,
     ModuleDef,
     Node,
-    NonblockingSubstitution,
     Output,
     ParamArg,
     Parameter,
@@ -45,7 +46,9 @@ from pyverilog.vparser.ast import (
 from pyverilog.vparser.parser import VerilogCodeParser
 
 from tapa.backend.xilinx import M_AXI_PREFIX
-from tapa.verilog.ast_utils import make_block, make_port_arg, make_pragma
+from tapa.common.unique_attrs import UniqueAttrs
+from tapa.util import Options
+from tapa.verilog.ast_utils import make_port_arg, make_pragma
 from tapa.verilog.util import (
     Pipeline,
     async_mmap_instance_name,
@@ -53,11 +56,12 @@ from tapa.verilog.util import (
     sanitize_array_name,
     wire_name,
 )
+from tapa.verilog.xilinx import ioport
 from tapa.verilog.xilinx.ast_types import Directive, IOPort, Logic, Signal
 from tapa.verilog.xilinx.async_mmap import ASYNC_MMAP_SUFFIXES, async_mmap_arg_name
+from tapa.verilog.xilinx.axis import AXIS_PORTS
 from tapa.verilog.xilinx.const import (
     CLK,
-    CLK_SENS_LIST,
     FIFO_READ_PORTS,
     FIFO_WRITE_PORTS,
     HANDSHAKE_CLK,
@@ -81,6 +85,9 @@ __all__ = [
     "Module",
     "generate_m_axi_ports",
 ]
+
+# vitis hls generated port infixes
+FIFO_INFIXES = ("_V", "_r", "_s", "")
 
 
 class Module:  # noqa: PLR0904  # TODO: refactor this class
@@ -117,6 +124,10 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
             if not name:
                 msg = "`files` and `name` cannot both be empty"
                 raise ValueError(msg)
+            if Options.enable_pyslang:
+                self._syntax_tree = pyslang.SyntaxTree.fromText(
+                    f"module {name}(); endmodule",
+                )
             self.ast = Source(
                 name,
                 Description([ModuleDef(name, Paramlist(()), Portlist(()), items=())]),
@@ -125,11 +136,12 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
             self._handshake_output_ports: dict[str, Assign] = {}
             self._calculate_indices()
             return
-        with tempfile.TemporaryDirectory(prefix="pyverilog-") as output_dir:  # noqa: PLR1702
+        with tempfile.TemporaryDirectory(prefix="pyverilog-") as output_dir:
             if is_trimming_enabled:
                 # trim the body since we only need the interface information
                 new_files = []
-                for idx, file in enumerate(files):
+
+                def gen_trimmed_file(file: str, idx: int) -> str:
                     lines = []
                     with open(file, encoding="utf-8") as fp:
                         for line in fp:
@@ -145,7 +157,10 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
                     new_file = os.path.join(output_dir, f"trimmed_{idx}.v")
                     with open(new_file, "w", encoding="utf-8") as fp:
                         fp.writelines(lines)
-                    new_files.append(new_file)
+                    return new_file
+
+                for idx, file in enumerate(files):
+                    new_files.append(gen_trimmed_file(file, idx))
                 files = new_files
             codeparser = VerilogCodeParser(
                 files,
@@ -153,6 +168,8 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
                 outputdir=output_dir,
                 debug=False,
             )
+            if Options.enable_pyslang:
+                self._syntax_tree = pyslang.SyntaxTree.fromFiles(files)
             self.ast: Source = codeparser.parse()
             self.directives: tuple[Directive, ...] = codeparser.get_directives()
         self._handshake_output_ports = {}
@@ -193,67 +210,50 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
 
     @property
     def _module_def(self) -> ModuleDef:
-        _module_defs = [
+        module_defs = [
             x for x in self.ast.description.definitions if isinstance(x, ModuleDef)
         ]
-        if len(_module_defs) != 1:
+        if len(module_defs) != 1:
             msg = "unexpected number of modules"
             raise ValueError(msg)
-        return _module_defs[0]
+        return module_defs[0]
 
     @property
     def name(self) -> str:
+        if Options.enable_pyslang:
+            return self._name_pyslang
         return self._module_def.name
 
-    @name.setter
-    def name(self, name: str) -> None:
-        self._module_def.name = name
+    @property
+    def _name_pyslang(self) -> str:
+        attrs = UniqueAttrs()
+
+        def visitor(node: object) -> None:
+            if isinstance(node, pyslang.ModuleDeclarationSyntax):
+                attrs.module_def = node
+
+        self._syntax_tree.root.visit(visitor)
+        assert isinstance(attrs.module_def, pyslang.ModuleDeclarationSyntax)
+        return attrs.module_def.header.name.valueText
 
     @property
-    def register_level(self) -> int:
-        """The register level of global control signals.
-
-        The minimum register level is 0, which means no additional registers are
-        inserted.
-
-        Returns
-        -------
-            int: N, where any global control signals are registered by N cycles.
-
-        """
-        return getattr(self, "_register_level", 0)
-
-    @register_level.setter
-    def register_level(self, level: int) -> None:
-        self._register_level = level
-
-    def partition_count_of(self, fifo_name: str) -> int:
-        """Get the partition count of each FIFO.
-
-        The minimum partition count is 1, which means the FIFO is implemented as a
-        whole, not many small FIFOs.
-
-        Args:
-        ----
-            fifo_name (str): Name of the FIFO.
-
-        Returns:
-        -------
-            int: N, where this FIFO is partitioned into N small FIFOs.
-
-        """
-        return getattr(self, "fifo_partition_count", {}).get(fifo_name, 1)
-
-    @property
-    def ports(self) -> dict[str, IOPort]:
-        port_lists = (x.list for x in self._module_def.items if isinstance(x, Decl))
-        return collections.OrderedDict(
-            (x.name, x)
+    def ports(self) -> dict[str, ioport.IOPort]:
+        port_lists = [
+            # ANSI style: ports declared in header
+            (x.first for x in self._module_def.portlist.ports if isinstance(x, Ioport)),
+            # Non-ANSI style: ports declared in body
+            *(x.list for x in self._module_def.items if isinstance(x, Decl)),
+        ]
+        return {
+            x.name: ioport.IOPort.create(x)
             for x in itertools.chain.from_iterable(port_lists)
             if isinstance(x, Input | Output | Inout)
-        )
+        }
 
-    def get_port_of(self, fifo: str, suffix: str) -> IOPort:
+    class NoMatchingPortError(ValueError):
+        """No matching port being found exception."""
+
+    def get_port_of(self, fifo: str, suffix: str) -> ioport.IOPort:
         """Return the IOPort of the given fifo with the given suffix.
 
         Args:
@@ -272,8 +272,7 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
         """
         ports = self.ports
         sanitized_fifo = sanitize_array_name(fifo)
-        infixes = ("_V", "_r", "_s", "")
-        for infix in infixes:
+        for infix in FIFO_INFIXES:
             port = ports.get(f"{sanitized_fifo}{infix}{suffix}")
             if port is not None:
                 return port
@@ -281,20 +280,24 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
         match = match_array_name(fifo)
         if match is not None and match[1] == 0:
             singleton_fifo = match[0]
-            for infix in infixes:
+            for infix in FIFO_INFIXES:
                 port = ports.get(f"{singleton_fifo}{infix}{suffix}")
                 if port is not None:
                     _logger.warning("assuming %s is a singleton array", singleton_fifo)
                     return port
+
         msg = f"module {self.name} does not have port {fifo}.{suffix}"
-        raise ValueError(msg)
+        raise Module.NoMatchingPortError(msg)
 
     def generate_istream_ports(
         self,
         port: str,
         arg: str,
+        ignore_peek_fifos: Iterable[str] = (),
     ) -> Iterator[PortArg]:
         for suffix in ISTREAM_SUFFIXES:
+            arg_name = None
+
             arg_name = wire_name(arg, suffix)
 
             # read port
@@ -302,19 +305,21 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
                 port=self.get_port_of(port, suffix).name,
                 arg=arg_name,
             )
-            if STREAM_PORT_DIRECTION[suffix] == "output":
-                arg_name = ""
 
-            # peek port
-            match = match_array_name(port)
-            if match is None:
-                peek_port = f"{port}_peek"
-            else:
-                peek_port = f"{match[0]}_peek[{match[1]}]"
-            yield make_port_arg(
-                port=self.get_port_of(peek_port, suffix).name,
-                arg=arg_name,
-            )
+            if STREAM_PORT_DIRECTION[suffix] == "input":
+                # peek port
+                if port in ignore_peek_fifos:
+                    continue
+                match = match_array_name(port)
+                if match is None:
+                    peek_port = f"{port}_peek"
+                else:
+                    peek_port = f"{match[0]}_peek[{match[1]}]"
+                assert arg_name
+                yield make_port_arg(
+                    port=self.get_port_of(peek_port, suffix).name,
+                    arg=arg_name,
+                )
 
     def generate_ostream_ports(
         self,
@@ -330,26 +335,62 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
     @property
     def signals(self) -> dict[str, Wire | Reg]:
         signal_lists = (x.list for x in self._module_def.items if isinstance(x, Decl))
-        return collections.OrderedDict(
-            (x.name, x)
+        return {
+            x.name: x
             for x in itertools.chain.from_iterable(signal_lists)
             if isinstance(x, Wire | Reg)
-        )
+        }
 
     @property
     def params(self) -> dict[str, Parameter]:
         param_lists = (x.list for x in self._module_def.items if isinstance(x, Decl))
-        return collections.OrderedDict(
-            (x.name, x)
+        return {
+            x.name: x
             for x in itertools.chain.from_iterable(param_lists)
             if isinstance(x, Parameter)
-        )
+        }
 
     @property
     def code(self) -> str:
         return "\n".join(
             directive for _, directive in self.directives
         ) + ASTCodeGenerator().visit(self.ast)
+
+    def get_template_code(self) -> str:
+        module = None
+        # Find the module definition
+        for description in self.ast.description.definitions:
+            if isinstance(description, ModuleDef):
+                module = description
+                break
+        assert module is not None
+
+        template_module_items = []
+        for item in module.items:
+            if isinstance(item, Decl):
+                for decl_item in item.list:
+                    if isinstance(decl_item, Input | Output | Inout | Parameter):
+                        template_module_items.append(item)
+                        continue
+
+        # Create the module definition
+        template_ast = Source(
+            self.ast.name,
+            Description(
+                [
+                    ModuleDef(
+                        name=module.name,
+                        paramlist=module.paramlist,
+                        portlist=module.portlist,
+                        items=template_module_items,
+                    )
+                ]
+            ),
+        )
+
+        return "\n".join(
+            directive for _, directive in self.directives
+        ) + ASTCodeGenerator().visit(template_ast)
 
     def _increment_idx(self, length: int, target: str) -> None:
         attr_map = {attr: priority for priority, attr in enumerate(self._ATTRS)}
@@ -406,6 +447,37 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
         self._increment_idx(len(decl_list), "io_port")
         return self
 
+    def del_port(self, port_name: str) -> None:
+        """Delete IO port from this module.
+
+        Args:
+        ----
+          port_name (str): Name of the IO port.
+
+        Raises:
+        ------
+          ValueError: Module does not have the port.
+        """
+        removed_ports = []
+
+        def func(item: Node) -> bool:
+            if isinstance(item, Decl):
+                for decl in item.list:
+                    if isinstance(decl, IOPort) and decl.name == port_name:
+                        removed_ports.append(decl.name)
+                        return False
+            return True
+
+        self._filter(func, "port")
+
+        if not removed_ports:
+            msg = f"no port {port_name} found in module {self.name}"
+            raise ValueError(msg)
+
+        self._module_def.portlist.ports = tuple(
+            x for x in self._module_def.portlist.ports if x.name != port_name
+        )
+
     def add_signals(self, signals: Iterable[Signal]) -> "Module":
         signal_tuple = tuple(signals)
         self._module_def.items = (
@@ -427,16 +499,6 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
         """
         self.add_signals(q.signals)
         logics: list[Logic] = [Assign(left=q[0], right=init)]
-        if q.level > 0:
-            logics.append(
-                Always(
-                    sens_list=CLK_SENS_LIST,
-                    statement=make_block(
-                        NonblockingSubstitution(left=q[i + 1], right=q[i])
-                        for i in range(q.level)
-                    ),
-                ),
-            )
         self.add_logics(logics)
 
     def del_signals(self, prefix: str = "", suffix: str = "") -> None:
@@ -562,7 +624,7 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
         self,
         name: str,
         rst: Node,
-        width: int,
+        width: Constant,
         depth: int,
     ) -> "Module":
         name = sanitize_array_name(name)
@@ -570,41 +632,26 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
         def ports() -> Iterator[PortArg]:
             yield make_port_arg(port="clk", arg=CLK)
             yield make_port_arg(port="reset", arg=rst)
-            yield from (
-                make_port_arg(port=port_name, arg=wire_name(name, arg_suffix))
-                for port_name, arg_suffix in zip(FIFO_READ_PORTS, ISTREAM_SUFFIXES)
-            )
+            for port_name, arg_suffix in zip(FIFO_READ_PORTS, ISTREAM_SUFFIXES):
+                yield make_port_arg(port=port_name, arg=wire_name(name, arg_suffix))
+
             yield make_port_arg(port=FIFO_READ_PORTS[-1], arg=TRUE)
-            yield from (
-                make_port_arg(port=port_name, arg=wire_name(name, arg_suffix))
-                for port_name, arg_suffix in zip(FIFO_WRITE_PORTS, OSTREAM_SUFFIXES)
-            )
+            for port_name, arg_suffix in zip(FIFO_WRITE_PORTS, OSTREAM_SUFFIXES):
+                yield make_port_arg(port=port_name, arg=wire_name(name, arg_suffix))
             yield make_port_arg(port=FIFO_WRITE_PORTS[-1], arg=TRUE)
 
-        partition_count = self.partition_count_of(name)
-
         module_name = "fifo"
-        level = []
-        if partition_count > 1:
-            module_name = "relay_station"
-            level.append(
-                ParamArg(
-                    paramname="LEVEL",
-                    argname=Constant(partition_count),
-                ),
-            )
         return self.add_instance(
             module_name=module_name,
             instance_name=name,
             ports=ports(),
             params=(
-                ParamArg(paramname="DATA_WIDTH", argname=Constant(width)),
+                ParamArg(paramname="DATA_WIDTH", argname=width),
                 ParamArg(
                     paramname="ADDR_WIDTH",
                     argname=Constant(max(1, (depth - 1).bit_length())),
                 ),
                 ParamArg(paramname="DEPTH", argname=Constant(depth)),
-                *level,
             ),
         )
 
@@ -709,16 +756,15 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
         addr_width: int = 64,
         id_width: int | None = None,
     ) -> "Module":
+        io_ports = []
         for channel, ports in M_AXI_PORTS.items():
-            io_ports = []
             for port, direction in ports:
                 io_port = (Input if direction == "input" else Output)(
                     name=f"{M_AXI_PREFIX}{name}_{channel}{port}",
                     width=get_m_axi_port_width(port, data_width, addr_width, id_width),
                 )
                 io_ports.append(with_rs_pragma(io_port))
-            self.add_ports(io_ports)
-        return self
+        return self.add_ports(io_ports)
 
     def cleanup(self) -> None:
         self.del_params(prefix="ap_ST_fsm_state")
@@ -754,14 +800,35 @@ class Module:  # noqa: PLR0904  # TODO: refactor this class
             ],
         )
 
-    def _get_nodes_of_type(self, node: object, *target_types: type) -> Iterator[object]:
-        if isinstance(node, target_types):
-            yield node
-        for c in node.children():
-            yield from self._get_nodes_of_type(c, *target_types)
 
-    def get_nodes_of_type(self, *target_types: type) -> Iterator:
-        yield from self._get_nodes_of_type(self.ast, *target_types)
+def get_streams_fifos(module: Module, streams_name: str) -> list[str]:
+    """Get all FIFOs that are related to a streams."""
+    pattern = re.compile(rf"{streams_name}_(\d+)_")
+    fifos = set()
+
+    for s in module.ports:
+        match = pattern.match(s)
+        if match:
+            number = match.group(1)
+            fifos.add(f"{streams_name}_{number}")
+
+    # singleton array without number
+    # when a stream array has length 1,
+    # the generated port name may not have the number
+    # in it.
+    # e.g., in tests/functional/singleton/vadd.cpp,
+    # "tapa::istreams<float, M>& a" where M = 1 resulted in
+    # stream data port a_s_dout rather than a_0_dout.
+    if not fifos:
+        for s in module.ports:
+            for infix in FIFO_INFIXES:
+                if s.startswith(f"{streams_name}{infix}"):
+                    return [streams_name]
+
+    if not fifos:
+        msg = f"no fifo found for {streams_name}"
+        raise ValueError(msg)
+    return list(fifos)
 
 
 def generate_m_axi_ports(
@@ -836,8 +903,12 @@ def get_rs_pragma(node: Input | Output) -> Pragma | None:
                 if node.name.endswith(f"_{channel}{port}"):
                     return make_pragma(
                         "RS_HS",
-                        f"{node.name[:-len(port)]}.{get_rs_port(port)}",
+                        f"{node.name[: -len(port)]}.{get_rs_port(port)}",
                     )
+
+        for suffix, role in AXIS_PORTS.items():
+            if node.name.endswith(suffix):
+                return make_pragma("RS_HS", f"{node.name[: -len(suffix)]}.{role}")
 
         _logger.error("not adding pragma for unknown port '%s'", node.name)
         return None

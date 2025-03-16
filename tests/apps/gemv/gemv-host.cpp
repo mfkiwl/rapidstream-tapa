@@ -6,14 +6,10 @@
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <tapa.h>
 
 #include "gemv.h"
 
 using std::vector;
-
-void Gemv(tapa::hmap<bits<DataVec>, kPcCount, kPcSize> mat_a,
-          tapa::mmap<bits<DataVec>> vec_x, tapa::mmap<bits<DataVec>> vec_y);
 
 DEFINE_string(bitstream, "", "path to bitstream file, run csim if empty");
 
@@ -58,8 +54,6 @@ int main(int argc, char* argv[]) {
   int64_t num_errors = 0;
   const int64_t threshold = 10;  // only report up to these errors
   for (int i = 0; i < kMatrixSize; i++) {
-    bool mismatch = false;
-
     Data expected = host_y[i];
     Data actual = y[i];
 

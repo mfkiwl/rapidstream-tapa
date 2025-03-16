@@ -4,6 +4,8 @@
 # All rights reserved. The contributor(s) of this file has/have agreed to the
 # RapidStream Contributor License Agreement.
 
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
 package(default_visibility = ["//tapacc:__subpackages__"])
 
 cc_library(
@@ -11,7 +13,9 @@ cc_library(
     hdrs = ["all_targets.h"],
     deps = [
         ":base_target",
+        ":xilinx_aie_target",
         ":xilinx_hls_target",
+        ":xilinx_non_synthesizable_target",
     ],
 )
 
@@ -29,6 +33,30 @@ cc_library(
     name = "xilinx_hls_target",
     srcs = ["xilinx_hls_target.cpp"],
     hdrs = ["xilinx_hls_target.h"],
+    deps = [
+        ":base_target",
+        "//tapacc/rewriter:mmap",
+        "//tapacc/rewriter:stream",
+        "//tapacc/rewriter:type",
+    ],
+)
+
+cc_library(
+    name = "xilinx_aie_target",
+    srcs = ["xilinx_aie_target.cpp"],
+    hdrs = ["xilinx_aie_target.h"],
+    deps = [
+        ":base_target",
+        "//tapacc/rewriter:mmap",
+        "//tapacc/rewriter:stream",
+        "//tapacc/rewriter:type",
+    ],
+)
+
+cc_library(
+    name = "xilinx_non_synthesizable_target",
+    srcs = ["xilinx_non_synthesizable_target.cpp"],
+    hdrs = ["xilinx_non_synthesizable_target.h"],
     deps = [
         ":base_target",
         "//tapacc/rewriter:mmap",
